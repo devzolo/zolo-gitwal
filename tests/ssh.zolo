@@ -1,0 +1,334 @@
+use std::http::ClientOptions
+use std::process::RunOptions
+//! Native OpenSSH proof against the disposable Compose SSH profile.
+//! Credentials stay in private fixture files and child environments.
+use std::{crypto, fs, hash, http, os, path, process, stream, string}
+use support::checked
+
+schema Proof {
+  token: str,
+  other_token: str,
+  repo: str,
+}
+
+schema Access {
+  visibility: str,
+  push_tokens: [str],
+}
+
+fn random_hex(count: int) -> str {
+  let digits = "0123456789abcdef"
+  var result = ""
+  for byte in crypto.random_bytes(count) {
+    result = result + digits.slice(byte >> 4, (byte >> 4) + 1) + digits.slice(
+      byte & 15,
+      (byte & 15) + 1,
+    )
+  }
+  result
+}
+
+// Never include subprocess diagnostics: a child can echo authorization headers.
+fn run(command: str, args: [str], cwd: str? = nil, env: #{str: str}? = nil) -> process::Output {
+  match process.run(
+    command,
+    args,
+    RunOptions {
+      cwd: cwd,
+      env: env,
+      timeout_ms: 180000,
+      max_output_bytes: 1048576,
+      max_stderr_bytes: 1048576,
+      env_remove: [
+        "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_DIR", "GIT_WORK_TREE", "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_DEFAULT_HASH",
+        "GIT_INDEX_FILE", "GIT_QUARANTINE_PATH", "GIT_CONFIG_COUNT", "GIT_SSH", "GIT_SSH_COMMAND",
+      ],
+    },
+  ) {
+    .Ok(output) => output,
+    .Err(_) => panic("SSH fixture subprocess could not complete: " + command),
+  }
+}
+
+fn successful(output: Output, label: str) -> process::Output {
+  if output.status != 0 { panic("SSH fixture failed: " + label) }
+  output
+}
+
+fn read(path: str) -> str {
+  let value: str? = fs.read(path)
+  value ?? panic("SSH fixture file could not be read")
+}
+
+fn read_proof(state: str) -> Proof {
+  match Proof.from_json(read(state + "/proof.json")) {
+    .Ok(proof) => proof,
+    .Err(_) => panic("invalid SSH fixture proof"),
+  }
+}
+
+fn write(path: str, content: str) {
+  if fs.write(path, content) is nil { panic("SSH fixture file could not be written") }
+  checked(fs.chmod(path, 384), "restrict SSH fixture file permissions")
+}
+
+fn prepare(state: str, env_file: str) {
+  if fs.mkdir(state) is nil { panic("cannot create SSH fixture state") }
+  checked(fs.chmod(state, 448), "restrict SSH fixture directory permissions")
+  for name in ["identity", "unregistered"] {
+    let path = state + "/" + name
+    if !fs.exists(path) {
+      successful(run("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", path]), "key generation")
+    }
+    checked(fs.chmod(path, 384), "restrict SSH private key permissions")
+  }
+  let proof_file = state + "/proof.json"
+  if !fs.exists(proof_file) {
+    let proof = Proof {
+      token: "zgw_" + random_hex(32),
+      other_token: "zgw_" + random_hex(32),
+      repo: "compose-ssh-" + random_hex(8),
+    }
+    write(proof_file, proof.to_json())
+  }
+  checked(fs.chmod(proof_file, 384), "restrict SSH proof permissions")
+  let proof = read_proof(state)
+  let public_key = read(state + "/identity.pub").trim()
+  if fs.mkdir(path.dirname(env_file)) is nil {
+    panic("cannot create SSH fixture environment directory")
+  }
+  write(
+    env_file,
+    "GITWAL_SSH_PUBLIC_KEY=\"" + public_key + "\"\nGITWAL_SSH_TOKEN=" + proof.token + "\n",
+  )
+  print("PASS prepared disposable SSH identity and shared HTTP principal")
+}
+
+fn ssh_args(state: str, unregistered: bool = false) -> [str] {
+  [
+    "-F", "/dev/null", "-i", state + if unregistered { "/unregistered" } else { "/identity" },
+    "-p", "2222", "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+    "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + state + "/known_hosts",
+  ]
+}
+
+fn environment(state: str, token: str? = nil) -> #{str: str} {
+  let arguments = ["ssh"].concat(ssh_args(state))
+  // Git interprets GIT_SSH_COMMAND using its POSIX shell; quote each fixed argument.
+  let command = arguments.map(|value| "'" + value.replace("'", "'\\''") + "'").join(" ")
+  var env: #{str: str} = #{
+    GIT_SSH_COMMAND: command,
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_COUNT: "0",
+  }
+  if token is not nil {
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
+    env["GIT_CONFIG_VALUE_0"] = "Authorization: Bearer " + token
+  }
+  env
+}
+
+fn git(state: str, args: [str], cwd: str? = nil, token: str? = nil) -> process::Output {
+  run("git", ["-c", "protocol.version=2"].concat(args), cwd, environment(state, token))
+}
+
+fn remote(name: str) -> str { "gitwal@ssh:" + name + ".git" }
+
+fn web(name: str) -> str { "http://gitwal:8080/" + name + ".git" }
+
+fn configure(name: str, token: str, visibility: str, digests: [str]) {
+  let access = Access { visibility, push_tokens: digests }
+  let response = http.fetch(
+    web(name) + "/config",
+    ClientOptions {
+      method: "PUT",
+      headers: #{authorization: "Bearer " + token, "content-type": "application/json"},
+      body: access.to_json(),
+      timeout: 30000,
+      follow_redirects: false,
+    },
+  )
+  if response is nil { panic("SSH ACL request did not complete") }
+  if response.status != 204 { panic("SSH ACL update failed") }
+}
+
+fn clone_check(state: str, url: str, label: str, expected: str, token: str? = nil) {
+  let destination = state + "/" + label + "-clone-" + random_hex(4)
+  successful(git(state, ["clone", url, destination], nil, token), label + " clone")
+  let actual = checked(
+    hash.sha256_file(destination + "/binary.dat", 4194304),
+    label + " binary hash",
+  )
+  if actual != expected { panic(label + " binary clone mismatch") }
+  let wanted_head = successful(
+    git(state, ["rev-parse", "HEAD"], state + "/source"),
+    "source commit",
+  )
+  let cloned_head = successful(
+    git(state, ["rev-parse", "HEAD"], destination),
+    label + " cloned commit",
+  )
+  if string.from_bytes(wanted_head.stdout) != string.from_bytes(cloned_head.stdout) {
+    panic(label + " clone did not retain the latest commit")
+  }
+  if read(destination + "/next.txt") != "durable\n" { panic(label + " incremental file mismatch") }
+  let format = successful(
+    git(state, ["rev-parse", "--show-object-format"], destination),
+    label + " object format",
+  )
+  if string.from_bytes(format.stdout).trim() != (os.getenv("GITWAL_OBJECT_FORMAT") ?? "sha1") {
+    panic(label + " clone object format mismatch")
+  }
+  successful(git(state, ["fsck", "--full"], destination, token), label + " object integrity")
+}
+
+fn reject(output: Output, label: str) {
+  if output.status == 0 { panic("SSH unexpectedly accepted " + label) }
+}
+
+fn verify(state: str, repeat: bool) {
+  let proof = read_proof(state)
+  let known = state + "/known_hosts"
+  if !fs.exists(known) {
+    let scan = successful(
+      run("ssh-keyscan", ["-p", "2222", "-t", "ed25519", "ssh"]),
+      "host key scan",
+    )
+    if scan.stdout.len() == 0 { panic("SSH fixture host key was not returned") }
+    write(known, string.from_bytes(scan.stdout))
+  }
+  let source = state + "/source"
+  let target = remote(proof.repo)
+  if !repeat {
+    if fs.exists(source) { panic("SSH state already contains a proof; use verify-repeat") }
+    if fs.mkdir(source) is nil { panic("cannot create SSH source") }
+    let format = os.getenv("GITWAL_OBJECT_FORMAT") ?? "sha1"
+    successful(
+      git(state, ["init", "--initial-branch=main", "--object-format=" + format], source),
+      "initialize source",
+    )
+    successful(git(state, ["config", "user.name", "Compose SSH"], source), "configure name")
+    successful(
+      git(state, ["config", "user.email", "compose-ssh@example.invalid"], source),
+      "configure email",
+    )
+    let binary = checked(stream.create(source + "/binary.dat"), "create SSH binary fixture")
+    var all_bytes: [int] = []
+    for byte in 0..256 { all_bytes.push(byte) }
+    for _ in 0..128 { checked(binary.write(all_bytes), "write SSH byte-range fixture") }
+    for _ in 0..32 {
+      checked(binary.write(crypto.random_bytes(65536)), "write SSH random binary fixture")
+    }
+    checked(binary.close(), "close SSH binary fixture")
+    successful(git(state, ["add", "."], source), "stage binary")
+    successful(git(state, ["commit", "-m", "SSH binary proof"], source), "commit binary")
+    successful(git(state, ["push", target, "HEAD:refs/heads/main"], source), "binary push")
+    print("PASS SSH binary push")
+    // A second commit exercises incremental packs and durable ref updates.
+    write(source + "/next.txt", "durable\n")
+    successful(git(state, ["add", "."], source), "stage next commit")
+    successful(git(state, ["commit", "-m", "incremental SSH proof"], source), "incremental commit")
+    successful(git(state, ["push", target, "HEAD:refs/heads/main"], source), "incremental push")
+    successful(git(state, ["tag", "remove-me"], source), "create tag")
+    successful(
+      git(
+        state,
+        ["push", "--atomic", target, "refs/tags/remove-me", "HEAD:refs/heads/topic"],
+        source,
+      ),
+      "atomic create",
+    )
+    let created = successful(git(state, ["ls-remote", target], source), "read atomic refs")
+    let refs = string.from_bytes(created.stdout)
+    if !refs.contains("refs/tags/remove-me") || !refs.contains("refs/heads/topic") {
+      panic("atomic SSH refs missing")
+    }
+    successful(
+      git(state, ["push", "--atomic", target, ":refs/tags/remove-me", ":refs/heads/topic"], source),
+      "atomic deletion",
+    )
+    let deleted = successful(
+      git(state, ["ls-remote", target, "refs/tags/remove-me", "refs/heads/topic"], source),
+      "read deleted refs",
+    )
+    if deleted.stdout.len() != 0 { panic("atomic SSH ref deletion did not persist") }
+    print("PASS SSH incremental push and atomic ref creation/deletion")
+  }
+  let expected = checked(
+    hash.sha256_file(source + "/binary.dat", 4194304),
+    "hash SSH source fixture",
+  )
+  clone_check(state, target, "ssh", expected)
+  clone_check(state, web(proof.repo), "http", expected, proof.token)
+  print("PASS SSH and HTTP binary clone, shared principal and object integrity")
+  // Run refusals after successful transport so a broken SSH server cannot satisfy them.
+  for command in [
+    "id", "git-upload-pack '../escape.git'", "git-upload-pack demo extra",
+    "git-receive-pack demo;id", "git-upload-pack '--help'", "git-upload-pack '/absolute.git'",
+  ] {
+    reject(run("ssh", ssh_args(state).concat(["gitwal@ssh", command])), "restricted command")
+  }
+  reject(
+    run(
+      "ssh",
+      ssh_args(state, true).concat(["gitwal@ssh", "git-upload-pack '" + proof.repo + ".git'"]),
+    ),
+    "unregistered key",
+  )
+  print(
+    "PASS SSH rejects shell commands, options, extra arguments, path escapes and unregistered keys",
+  )
+
+  if !repeat {
+    // Keep ACL mutations on a separate repository; the primary restart proof stays readable.
+    let acl = proof.repo + "-acl"
+    let acl_remote = remote(acl)
+    successful(
+      git(state, ["push", acl_remote, "HEAD:refs/heads/main"], source),
+      "create ACL repository",
+    )
+    reject(git(state, ["ls-remote", web(acl)], source), "anonymous private fetch")
+    reject(
+      git(state, ["ls-remote", web(acl)], source, proof.other_token),
+      "foreign private principal",
+    )
+    configure(acl, proof.token, "public", [hash.sha256(proof.token)])
+    clone_check(state, web(acl), "public", expected)
+    reject(
+      git(state, ["push", web(acl), "HEAD:refs/heads/denied"], source, proof.other_token),
+      "foreign public push",
+    )
+    // Removing ownership while public exercises an authenticated SSH reader
+    // without adding a second administrator-selected key to the server.
+    configure(acl, proof.token, "public", [hash.sha256(proof.other_token)])
+    clone_check(state, acl_remote, "ssh-public", expected)
+    reject(
+      git(state, ["push", acl_remote, "HEAD:refs/heads/denied"], source),
+      "non-owner SSH public push",
+    )
+    configure(acl, proof.other_token, "private", [hash.sha256(proof.other_token)])
+    // The fixed OpenSSH identity is unchanged; authorization is rechecked for each session.
+    reject(git(state, ["ls-remote", acl_remote], source), "revoked SSH fetch")
+    reject(git(state, ["push", acl_remote, "HEAD:refs/heads/revoked"], source), "revoked SSH push")
+    clone_check(state, web(acl), "replacement", expected, proof.other_token)
+    configure(acl, proof.other_token, "private", [hash.sha256(proof.token)])
+    successful(git(state, ["ls-remote", acl_remote], source), "restored SSH principal")
+    print("PASS private ACL, public visibility and immediate SSH fetch/push revocation")
+  }
+}
+
+fn main() {
+  let args = process.argv()
+  if args.len() != 2 { panic("usage: gitwal-ssh-test prepare|verify|verify-repeat") }
+  let state = os.getenv("GITWAL_SSH_TEST_STATE") ?? "/state/ssh"
+  match args[1] {
+    "prepare" => prepare(state, os.getenv("GITWAL_SSH_TEST_ENV") ?? "/proof/ssh.env"),
+    "verify" => verify(state, false),
+    "verify-repeat" => verify(state, true),
+    _ => panic("unknown SSH fixture mode"),
+  }
+}

@@ -1,0 +1,12 @@
+use monitor::page as render_page
+use monitor_page::page as shipped_page
+
+@test
+fn shipped_monitor_matches_verniz_source_and_privacy_headers() {
+  let source = render_page()
+  let shipped = shipped_page()
+  assert(source.body.replace("\r\n", "\n") == shipped.body.replace("\r\n", "\n"))
+  for name in ["content-type", "cache-control", "referrer-policy", "x-content-type-options", "content-security-policy"] {
+    assert(source.headers[name] == shipped.headers[name])
+  }
+}

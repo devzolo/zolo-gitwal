@@ -1,0 +1,176 @@
+//! Request-scoped credentials; only SHA-256 token hashes enter persistent metadata.
+use std::{base64, crypto, hash, string}
+use object_store::Store
+use wal::{prefix, utc_now}
+
+pub enum Credential {
+  Anonymous,
+  Malformed,
+  Token(str),
+}
+
+pub schema AccessConfig {
+  visibility: str where |v| v == "public" || v == "private",
+  push_tokens: [str] where |v| v.len() > 0 && v.len() <= 64,
+}
+
+pub schema Metadata {
+  version: int where |v| v == 1,
+  name: str,
+  visibility: str where |v| v == "public" || v == "private",
+  push_tokens: [str] where |v| v.len() > 0 && v.len() <= 64,
+  created_at: str,
+  object_format: str where |v| v == "sha1" || v == "sha256" = "sha1",
+}
+
+pub struct MetaSnapshot(meta: Metadata, etag: str)
+
+pub fn valid_hash(value: str) -> bool {
+  if value.len() != 64 { return false }
+  value.bytes().all(_ >= 48 && _ <= 57 || _ >= 97 && _ <= 102)
+}
+
+pub fn new_token() -> str {
+  let digits = "0123456789abcdef"
+  var token = "zgw_"
+  for b in crypto.random_bytes(32) {
+    token = token + digits.slice(b >> 4, (b >> 4) + 1) + digits.slice(b & 15, (b & 15) + 1)
+  }
+  token
+}
+
+pub fn credential(header: str?) -> Credential {
+  let text = header ?? ""
+  if text == "" { return .Anonymous }
+  let separator = text.index_of(" ")
+  if separator < 0 { return .Malformed }
+  let scheme = text.slice(0, separator).lower()
+  let value = text.slice(separator + 1, text.len()).trim_start()
+  var token = ""
+  if scheme == "bearer" {
+    token = value
+  } else if scheme == "basic" {
+    let decoded = base64.decode(value)
+    if decoded is nil { return .Malformed }
+    let pair: str = decoded
+    let colon = pair.index_of(":")
+    if colon < 0 { return .Malformed }
+    token = pair.slice(colon + 1, pair.len())
+  } else { return .Malformed }
+  if token.len() != 68 || !(token.starts_with("zgw_") || token.starts_with("nwl_")) || !valid_hash(
+    token.slice(4, token.len()),
+  ) { return .Malformed }
+  .Token(hash.sha256(token))
+}
+
+pub fn load_meta(store: Store, name: str) -> Result<MetaSnapshot?, str> {
+  match store.get(prefix(name) + "repo.json", nil)? {
+    .Missing => .Ok(nil),
+    .NotModified => .Err("unexpected conditional metadata response"),
+    .Found(object) => {
+      let decoded: Result<Metadata, str> = Metadata.from_json(string.from_bytes(object.data))
+      let meta = decoded recover {
+        error => return .Err("invalid repository metadata: {error}"),
+      }
+      if meta.name != name { return .Err("metadata repository mismatch") }
+      for token in meta.push_tokens {
+        if !valid_hash(token) { return .Err("invalid stored token hash") }
+      }
+      .Ok(MetaSnapshot { meta, etag: object.etag })
+    },
+  }
+}
+
+pub fn can_push(meta: Metadata, credential: Credential) -> bool {
+  match credential {
+    .Token(digest) => meta.push_tokens.contains(digest),
+    _ => false,
+  }
+}
+
+pub fn can_fetch(meta: Metadata, credential: Credential) -> bool {
+  match credential {
+    .Malformed => false,
+    _ => meta.visibility == "public" || can_push(meta, credential),
+  }
+}
+
+pub fn claim(
+  store: Store,
+  name: str,
+  credential: Credential,
+  format: str = "sha1",
+) -> Result<MetaSnapshot, str> {
+  guard credential is .Token(digest) else { return .Err("a valid bearer token is required") }
+  let meta = Metadata {
+    version: 1,
+    name,
+    visibility: "private",
+    push_tokens: [digest],
+    created_at: utc_now()?,
+    object_format: format,
+  }
+  match store.put(prefix(name) + "repo.json", meta.to_json().bytes(), .Create)? {
+    .Written(etag) => .Ok(MetaSnapshot { meta, etag }),
+    .Conflict => match load_meta(store, name)? {
+      nil => .Err("repository metadata disappeared"),
+      existing => {
+        if !can_push(existing.meta, credential) {
+          return .Err("repository belongs to another token")
+        }
+        if existing.meta.object_format != format {
+          return .Err("repository object format mismatch")
+        }
+        .Ok(existing)
+      },
+    },
+  }
+}
+
+pub fn configure(
+  store: Store,
+  name: str,
+  credential: Credential,
+  config: AccessConfig,
+) -> Result<nil, str> {
+  for token in config.push_tokens {
+    if !valid_hash(token) { return .Err("expected SHA-256 token hashes") }
+  }
+  let loaded = load_meta(store, name)?
+  if loaded is nil { return .Err("repository not found") }
+  let current = loaded
+  if !can_push(current.meta, credential) { return .Err("access denied") }
+  let next = current.meta with {
+    visibility: config.visibility,
+    push_tokens: config.push_tokens,
+  }
+  match store.put(prefix(name) + "repo.json", next.to_json().bytes(), .Match(current.etag))? {
+    .Written(_) => .Ok(nil),
+    .Conflict => .Err("metadata changed; reload and retry"),
+  }
+}
+
+@test
+fn token_validation_does_not_accept_malformed_credentials() {
+  let token = "zgw_" + "a".repeat_(64)
+  match credential("Bearer " + token) {
+    .Token(_) => { },
+    _ => panic("valid token"),
+  }
+  match credential("bEaReR " + token) {
+    .Token(_) => { },
+    _ => panic("case-insensitive scheme"),
+  }
+  match credential("bAsIc " + base64.encode("git:" + token)) {
+    .Token(_) => { },
+    _ => panic("basic scheme"),
+  }
+  match credential("Bearer short") {
+    .Malformed => { },
+    _ => panic("invalid token"),
+  }
+  match credential(nil) {
+    .Anonymous => { },
+    _ => panic("anonymous"),
+  }
+}

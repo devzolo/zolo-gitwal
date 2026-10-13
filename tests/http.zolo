@@ -1,0 +1,440 @@
+use std::http::ClientOptions
+use std::process::RunOptions
+//! Real Git and HTTP contracts against the Compose service.
+//! `create` saves a private fixture; `verify` checks it after restart/cache removal.
+use std::{process, os, fs, stream, hash, crypto, http, string}
+use support::checked
+
+const PAYLOAD_BYTES: int = 8388608
+
+schema State {
+  repository: str,
+  token: str,
+  text: str,
+  commit: str,
+  binary_sha256: str,
+  object_format: str = "sha1",
+}
+
+schema Config {
+  visibility: str,
+  push_tokens: [str],
+}
+
+schema Ref {
+  name: str,
+  oid: str,
+}
+
+schema Index {
+  version: int,
+  entries: [str],
+  superseded: [str],
+  refs: [Ref],
+  head: str?,
+  object_format: str = "sha1",
+}
+
+fn ensure(condition: bool, message: str) {
+  if !condition { panic("FAIL " + message) }
+}
+
+fn token() -> str {
+  let digits = "0123456789abcdef"
+  var value = "zgw_"
+  for byte in crypto.random_bytes(32) {
+    value = value + digits.slice(byte >> 4, (byte >> 4) + 1) + digits.slice(
+      byte & 15,
+      (byte & 15) + 1,
+    )
+  }
+  value
+}
+
+fn valid_token(value: str) -> bool {
+  if !value.starts_with("zgw_") || value.len() != 68 { return false }
+  for byte in value.slice(4).bytes() {
+    if !(byte >= 48 && byte <= 57 || byte >= 97 && byte <= 102) { return false }
+  }
+  true
+}
+
+fn request(
+  base: str,
+  path: str,
+  credential: str? = nil,
+  method: str = "GET",
+  body: [int] = [],
+  content_type: str = "application/json",
+) -> http::ClientResponse {
+  let headers: #{str: str} = #{"content-type": content_type}
+  if credential is not nil { headers["authorization"] = "Bearer " + credential }
+  http.fetch(
+    base + path,
+    ClientOptions {
+      method: method,
+      headers: headers,
+      body_bytes: body,
+      timeout: 120000,
+      follow_redirects: false,
+    },
+  ) ?? panic("FAIL HTTP transport failed")
+}
+
+fn ready(base: str) {
+  let wait_seconds = os.getenv("GITWAL_TEST_TIMEOUT") ?? "120"
+  let seconds = checked(wait_seconds.parse::<int>(), "parse test readiness timeout")
+  let deadline = process.uptime() + (seconds as? float ?? 120.0)
+  while process.uptime() < deadline {
+    let response = http.fetch(base + "/healthz", ClientOptions { timeout: 2000 })
+    if response is not nil && response.status == 200 && response.body.trim() == "ok" { return }
+    process.sleep(1000)
+  }
+  panic("FAIL Gitwal health endpoint did not become ready")
+}
+
+fn git(
+  directory: str,
+  args: [str],
+  credential: str? = nil,
+  success: bool = true,
+  input: [int] = [],
+) -> process::Output {
+  let env: #{str: str} = #{
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_COUNT: if credential is nil { "0" } else { "1" },
+  }
+  if credential is not nil {
+    env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
+    env["GIT_CONFIG_VALUE_0"] = "Authorization: Bearer " + credential
+  }
+  let output = checked(
+    process.run(
+      "git",
+      ["-c", "credential.helper=", "-c", "protocol.version=2"].concat(args),
+      RunOptions {
+        cwd: directory,
+        env: env,
+        stdin: input,
+        timeout_ms: 120000,
+        max_output_bytes: 1048576,
+        max_stderr_bytes: 1048576,
+        env_remove: [
+          "GIT_TRACE", "GIT_TRACE_CURL", "GIT_CURL_VERBOSE", "GIT_DIR",
+          "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+          "GIT_NAMESPACE", "GIT_DEFAULT_HASH", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG",
+        ],
+      },
+    ),
+    "run Git " + args[0],
+  )
+  if success && output.status != 0 {
+    let diagnostic = if credential is nil { output.stderr } else {
+      output.stderr.replace(credential, "[redacted]")
+    }
+    panic("FAIL Git " + args[0] + ": " + diagnostic)
+  }
+  ensure(success || output.status != 0, "unauthorized Git operation succeeded")
+  output
+}
+
+fn git_text(directory: str, args: [str], credential: str? = nil) -> str {
+  string.from_bytes(git(directory, args, credential).stdout).trim()
+}
+
+fn cli() {
+  let executable = os.getenv("GITWAL_TEST_SERVER") ?? "/usr/local/bin/zolo-gitwal"
+  let help = checked(process.run(executable, ["--help"]), "run CLI help")
+  ensure(help.status == 0 && string.from_bytes(help.stdout).contains("hash-token"), "CLI help")
+  let generated = checked(process.run(executable, ["token"]), "generate CLI token")
+  let credential = string.from_bytes(generated.stdout).trim()
+  ensure(generated.status == 0 && valid_token(credential), "CLI generated token format")
+  let hashed = checked(
+    process.run(
+      executable,
+      ["hash-token"],
+      RunOptions {
+        env: #{GITWAL_TOKEN: credential},
+        timeout_ms: 30000,
+      },
+    ),
+    "hash CLI credential",
+  )
+  ensure(
+    hashed.status == 0 && string.from_bytes(hashed.stdout).trim() == hash.sha256(credential),
+    "CLI credential hash",
+  )
+  let invalid = checked(process.run(executable, ["unknown-command"]), "run invalid CLI command")
+  ensure(invalid.status != 0 && invalid.stderr.contains("unknown command"), "CLI invalid command")
+  print("PASS CLI help, token generation, hashing and invalid command diagnostics")
+}
+
+fn private_acl(base: str, state: State, directory: str) {
+  let path = "/" + state.repository + ".git"
+  for presented in [nil, token()] {
+    ensure(
+      request(base, path + "/info/refs?service=git-upload-pack", presented).status == 404,
+      "private discovery must return 404",
+    )
+  }
+  git(directory, ["clone", base + path, "denied-" + crypto.uuid()], success: false)
+  let response = request(base, path + "/config", state.token)
+  ensure(response.status == 200, "authenticated configuration unavailable")
+  let config = checked(Config.from_json(response.body), "decode repository configuration")
+  ensure(config.visibility == "private", "repository must be private")
+  ensure(
+    config.push_tokens.len() == 1 && config.push_tokens[0] == hash.sha256(state.token),
+    "ACL must persist only the credential hash",
+  )
+  ensure(!response.body.contains(state.token), "configuration exposed credential")
+}
+
+fn clone(base: str, state: State, directory: str, name: str, authenticated: bool = true) {
+  let credential = if authenticated { state.token } else { nil }
+  git(
+    directory,
+    ["clone", "--branch", "main", base + "/" + state.repository + ".git", name],
+    credential,
+  )
+  let target = directory + "/" + name
+  ensure(git_text(target, ["rev-parse", "HEAD"]) == state.commit, "clone has wrong commit")
+  ensure(
+    checked(hash.sha256_file(target + "/binary.dat", PAYLOAD_BYTES), "hash cloned binary") == state.binary_sha256,
+    "clone changed binary contents",
+  )
+  ensure(fs.read(target + "/README.txt") == state.text, "clone changed text")
+  git(target, ["fsck", "--full"])
+  let response = request(base, "/" + state.repository + ".git/monitor", credential)
+  ensure(response.status == 200, "monitor unavailable")
+  let index = checked(Index.from_json(response.body), "decode durable monitor index")
+  var found = false
+  for reference in index.refs {
+    if reference.name == "refs/heads/main" && reference.oid == state.commit { found = true }
+  }
+  ensure(found, "durable monitor differs from pushed commit")
+}
+
+fn packet(payload: str) -> str {
+  let digits = "0123456789abcdef"
+  let size = payload.bytes().len() + 4
+  var header = ""
+  for shift in [12, 8, 4, 0] {
+    let digit = size >> shift & 15
+    header = header + digits.slice(digit, digit + 1)
+  }
+  header + payload
+}
+
+fn transactions(base: str, state: State, source: str, first: str) {
+  let path = "/" + state.repository + ".git"
+  let before = request(base, path + "/monitor", state.token).body
+  // All referenced objects are already durable: an empty valid pack suffices.
+  let pack = git(source, ["pack-objects", "--revs", "--stdout"]).stdout
+  let command = packet(first + " " + state.commit + " refs/heads/main\0report-status atomic\n") + "0000"
+  let duplicate = request(
+    base,
+    path + "/git-receive-pack",
+    state.token,
+    "POST",
+    command.bytes().concat(pack),
+    "application/x-git-receive-pack-request",
+  )
+  ensure(
+    duplicate.status == 200 && duplicate.body.contains("ok refs/heads/main"),
+    "push redelivery",
+  )
+  ensure(
+    request(base, path + "/monitor", state.token).body == before,
+    "push redelivery changed WAL",
+  )
+  let batch = packet(
+    "0".repeat_(state.commit.len()) + " " + state.commit + " refs/tags/atomic-check\0report-status atomic\n",
+  ) + packet(first + " " + state.commit + " refs/heads/main\n") + "0000"
+  let rejected = request(
+    base,
+    path + "/git-receive-pack",
+    state.token,
+    "POST",
+    batch.bytes().concat(pack),
+    "application/x-git-receive-pack-request",
+  )
+  ensure(
+    rejected.status == 200 && rejected.body.contains("ng refs/tags/atomic-check") && rejected.body.contains(
+      "ng refs/heads/main",
+    ),
+    "stale ref must reject entire atomic push",
+  )
+  ensure(
+    request(base, path + "/monitor", state.token).body == before,
+    "rejected transaction changed WAL",
+  )
+  print(
+    "PASS exact push redelivery is a WAL no-op; stale ref rejects the entire atomic transaction",
+  )
+}
+
+fn metadata(base: str, state: State, directory: str, source: str) {
+  let path = "/" + state.repository + ".git"
+  let outsider = token()
+  let public = Config { visibility: "public", push_tokens: [hash.sha256(state.token)] }
+  ensure(
+    request(base, path + "/config", outsider, "PUT", public.to_json().bytes()).status == 404,
+    "unrelated token changed metadata",
+  )
+  ensure(
+    request(base, path + "/config", state.token, "PUT", [123]).status == 400,
+    "invalid metadata accepted",
+  )
+  ensure(
+    request(base, path + "/config", state.token, "POST").status == 405,
+    "invalid config method",
+  )
+  ensure(
+    request(base, path + "/config", state.token, "PUT", public.to_json().bytes()).status == 204,
+    "public metadata update",
+  )
+  ensure(request(base, path + "/config").status == 403, "anonymous public ACL disclosure")
+  clone(base, state, directory, "public-clone", false)
+  git(source, ["tag", "disposable"])
+  git(source, ["push", base + path, "refs/tags/disposable"], state.token)
+  git(source, ["push", base + path, ":refs/tags/disposable"], state.token)
+  ensure(
+    git_text(source, ["ls-remote", base + path, "refs/tags/disposable"], state.token) == "",
+    "deleted ref still advertised",
+  )
+  let rotated = Config { visibility: "private", push_tokens: [hash.sha256(outsider)] }
+  ensure(
+    request(base, path + "/config", state.token, "PUT", rotated.to_json().bytes()).status == 204,
+    "credential rotation",
+  )
+  ensure(request(base, path + "/monitor", state.token).status == 404, "revoked token still reads")
+  git(source, ["push", base + path, "HEAD:refs/heads/revoked"], state.token, false)
+  let restored = Config { visibility: "private", push_tokens: [hash.sha256(state.token)] }
+  ensure(
+    request(base, path + "/config", outsider, "PUT", restored.to_json().bytes()).status == 204,
+    "restore private persistence fixture",
+  )
+  print("PASS metadata authorization, public clone, ref deletion and credential revocation")
+}
+
+fn main() {
+  let args = process.argv()
+  let mode = if args.len() > 1 { args[1] } else { "create" }
+  ensure(mode == "create" || mode == "verify", "usage: gitwal-http-test [create|verify]")
+  let configured = os.getenv("GITWAL_TEST_URL") ?? "http://gitwal:8080"
+  let base = if configured.ends_with("/") { configured.slice(0, configured.len() - 1) } else {
+    configured
+  }
+  let state_path = os.getenv("GITWAL_TEST_STATE") ?? "/state/smoke.json"
+  let root = fs.temp_dir() + "/gitwal-http-" + crypto.uuid()
+  ensure(fs.mkdir(root) is not nil, "cannot create owned test directory")
+  defer fs.rmdir(root, true)
+  ready(base)
+  cli()
+  let page = request(base, "/")
+  ensure(
+    page.status == 200 && page.body.contains("id=\"connect\"") && page.body.contains(
+      "id=\"dashboard\"",
+    ),
+    "anonymous web monitor",
+  )
+  ensure(page.headers["cache-control"] == "no-store", "monitor cache policy")
+  ensure(
+    (page.headers["content-security-policy"] ?? "").contains("connect-src 'self'"),
+    "monitor CSP",
+  )
+  ensure(
+    request(base, "/.hidden.git/info/refs?service=git-receive-pack").status == 404,
+    "hidden route",
+  )
+  print("PASS anonymous health, web monitor and invalid route")
+  if mode == "verify" {
+    let state = checked(
+      State.from_json(fs.read(state_path) ?? panic("FAIL missing persistence state")),
+      "decode persistence state",
+    )
+    private_acl(base, state, root)
+    clone(base, state, root, "restored")
+    print("PASS private ACL, committed refs and 8 MiB binary survived restart/cache removal")
+    return
+  }
+  let source = root + "/source"
+  ensure(fs.mkdir(source) is not nil, "cannot create source")
+  let format = os.getenv("GITWAL_TEST_OBJECT_FORMAT") ?? "sha1"
+  ensure(format == "sha1" || format == "sha256", "test object format must be sha1 or sha256")
+  git(source, ["init", "--initial-branch=main", "--object-format=" + format])
+  git(source, ["config", "user.name", "Gitwal Test"])
+  git(source, ["config", "user.email", "test@example.invalid"])
+  let writer = checked(stream.create(source + "/binary.dat"), "create binary payload")
+  for _ in 0..128 {
+    checked(writer.write(crypto.random_bytes(65536)), "write random payload chunk")
+  }
+  checked(writer.close(), "close binary payload")
+  var state = State {
+    repository: "compose-smoke-" + crypto.uuid(),
+    token: token(),
+    text: "First Compose push\n",
+    commit: "",
+    binary_sha256: checked(
+      hash.sha256_file(source + "/binary.dat", PAYLOAD_BYTES),
+      "hash source binary",
+    ),
+    object_format: format,
+  }
+  ensure(fs.write(source + "/README.txt", state.text) is not nil, "write initial text")
+  git(source, ["add", "."])
+  git(source, ["commit", "-m", "First smoke commit"])
+  let remote = base + "/" + state.repository + ".git"
+  git(source, ["-c", "http.postBuffer=1", "push", remote, "HEAD:refs/heads/main"], state.token)
+  state.commit = git_text(source, ["rev-parse", "HEAD"])
+  let first = state.commit
+  private_acl(base, state, root)
+  clone(base, state, root, "first-clone")
+  ensure(
+    request(
+      base,
+      "/" + state.repository + ".git/git-receive-pack",
+      state.token,
+      "POST",
+      "zzzz".bytes(),
+      "application/x-git-receive-pack-request",
+    ).status == 400,
+    "invalid packet accepted",
+  )
+  print("PASS first chunked push, private ACL, binary clone, Git integrity and invalid packet")
+  ensure(fs.write(source + "/README.txt", "Second Compose push\n") is not nil, "write second text")
+  git(source, ["commit", "-am", "Second smoke commit"])
+  git(source, ["push", remote, "HEAD:refs/heads/main"], token(), false)
+  clone(base, state, root, "after-denied-push")
+  git(source, ["push", remote, "HEAD:refs/heads/main"], state.token)
+  state.commit = git_text(source, ["rev-parse", "HEAD"])
+  state.text = "Second Compose push\n"
+  clone(base, state, root, "second-clone")
+  git(root + "/first-clone", ["fetch", "origin"], state.token)
+  ensure(
+    git_text(root + "/first-clone", ["rev-parse", "origin/main"]) == state.commit,
+    "incremental fetch",
+  )
+  print("PASS unrelated-token push refused, second push, fresh clone and incremental fetch")
+  transactions(base, state, source, first)
+  metadata(base, state, root, source)
+  private_acl(base, state, root)
+  let path_parts = state_path.split("/")
+  var state_directory = ""
+  for index in 0..path_parts.len() - 1 {
+    state_directory = state_directory + path_parts[index] + "/"
+  }
+  if state_directory == "" { state_directory = "." }
+  if !fs.exists(state_directory) {
+    ensure(fs.mkdir(state_directory) is not nil, "cannot create state directory")
+  }
+  ensure(fs.write(state_path, state.to_json()) is not nil, "cannot save persistence state")
+  let permissions = checked(
+    process.run("chmod", ["600", state_path]),
+    "restrict persistence state permissions",
+  )
+  ensure(permissions.status == 0, "cannot restrict disposable credential state")
+  print("PASS persistence fixture saved with private permissions")
+}

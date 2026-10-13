@@ -1,0 +1,359 @@
+//! Immutable packs + metadata, published by a single conditional index write.
+use domain
+use domain::RefUpdate
+use std::{crypto, hash, os, string, stream}
+use object_store::{Store, PutCondition, PutResult}
+use domain::{
+  zero_oid, valid_oid, valid_ref, tip, apply_updates, is_noop, choose_head,
+  validate_updates,
+}
+use sequence::equal
+use pack::{Pack, temporary, inspect}
+
+pub schema Index {
+  version: int where |v| v == 1,
+  entries: [str],
+  superseded: [str],
+  refs: [domain.RefTip],
+  head: str?,
+  object_format: str where |v| v == "sha1" || v == "sha256" = "sha1",
+}
+
+pub schema Entry {
+  version: int where |v| v == 1,
+  key: str,
+  updates: [domain.RefUpdate],
+  pack_bytes: int where |v| v >= 0,
+  pack_sha256: str,
+  pushed_at: str,
+}
+
+pub struct Snapshot(index: Index, etag: str?)
+
+pub struct Publication(snapshot: Snapshot, changed: bool)
+
+pub fn utc_now() -> Result<str, str> {
+  let value = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  if value is str { return .Ok(value) }
+  .Err("UTC timestamp formatting failed")
+}
+
+pub fn empty(format: str = "sha1") -> Snapshot {
+  Snapshot {
+    index: Index {
+      version: 1,
+      entries: [],
+      superseded: [],
+      refs: [],
+      head: nil,
+      object_format: format,
+    },
+    etag: nil,
+  }
+}
+
+pub fn prefix(name: str) -> str { "repos/" + name + "/" }
+
+pub fn valid_key(key: str) -> bool {
+  if key.len() != 36 { return false }
+  for byte in key.bytes() {
+    if !(byte >= 48 && byte <= 57 || byte >= 97 && byte <= 102 || byte == 45) { return false }
+  }
+  true
+}
+
+pub fn validate_index(index: Index) -> Result<Index, str> {
+  let seen: [str] = []
+  for key in index.entries.concat(index.superseded) {
+    if !valid_key(key) || seen.contains(key) { return .Err("corrupt WAL entry chain") }
+    seen.push(key)
+  }
+  let names: [str] = []
+  for reference in index.refs {
+    if !valid_ref(reference.name) || !valid_oid(reference.oid, index.object_format) || reference.oid == zero_oid(
+      index.object_format,
+    ) || names.contains(reference.name) { return .Err("corrupt WAL references") }
+    names.push(reference.name)
+  }
+  apply_updates(index.refs, [], index.object_format)?
+  let head = index.head
+  if head is not nil && (!head.starts_with("refs/heads/") || tip(
+    index.refs,
+    head,
+    index.object_format,
+  ) == zero_oid(index.object_format)) {
+    return .Err("corrupt WAL HEAD")
+  }
+  .Ok(index)
+}
+
+pub fn load(store: Store, name: str, format: str = "sha1") -> Result<Snapshot, str> {
+  match store.get(prefix(name) + "index.json", nil)? {
+    .Missing => .Ok(empty(format)),
+    .NotModified => .Err("unexpected conditional index response"),
+    .Found(object) => {
+      let parsed = match Index.from_json(string.from_bytes(object.data)) {
+        .Ok(value) => value,
+        .Err(error) => { return .Err("invalid WAL index: {error}") },
+      }
+      return .Ok(Snapshot { index: validate_index(parsed)?, etag: object.etag })
+    },
+  }
+}
+
+pub fn read_entry(store: Store, name: str, key: str) -> Result<Entry, str> {
+  if !valid_key(key) { return .Err("invalid WAL entry key") }
+  match store.get(prefix(name) + "wal/" + key + ".json", nil)? {
+    .Found(object) => {
+      let entry = match Entry.from_json(string.from_bytes(object.data)) {
+        .Ok(value) => value,
+        .Err(error) => { return .Err("invalid WAL entry: {error}") },
+      }
+      if entry.key != key || entry.pack_sha256.len() != 64 {
+        return .Err("corrupt WAL entry")
+      }
+      .Ok(entry)
+    },
+    _ => .Err("missing WAL entry"),
+  }
+}
+
+pub fn read_pack(store: Store, name: str, entry: Entry) -> Result<[int], str> {
+  match store.get(prefix(name) + "wal/" + entry.key + ".pack", nil)? {
+    .Found(object) => {
+      if object.data.len() != entry.pack_bytes || hash.sha256(object.data) != entry.pack_sha256 {
+        return .Err("WAL pack integrity mismatch")
+      }
+      .Ok(object.data)
+    },
+    _ => .Err("missing WAL pack"),
+  }
+}
+
+fn stage(store: Store, name: str, updates: [domain.RefUpdate], pack: [int]) -> Result<str, str> {
+  let key = crypto.uuid()
+  let base = prefix(name) + "wal/" + key
+  let entry = Entry {
+    version: 1,
+    key,
+    updates,
+    pack_bytes: pack.len(),
+    pack_sha256: hash.sha256(pack),
+    pushed_at: utc_now()?,
+  }
+  match store.put(base + ".pack", pack, .Create)? {
+    .Conflict => { return .Err("immutable pack key collision") },
+    .Written(_) => { },
+  }
+  match store.put(base + ".json", entry.to_json().bytes(), .Create)? {
+    .Conflict => .Err("immutable entry key collision"),
+    .Written(_) => .Ok(key),
+  }
+}
+
+pub fn read_pack_file(store: Store, name: str, entry: Entry, directory: str) -> Result<Pack, str> {
+  let path = temporary(directory)?
+  let writer = match stream.create(path.path) {
+    .Ok(value) => value,
+    .Err(error) => { path.close(); return .Err(error) },
+  }
+  let downloaded = store.download(
+    prefix(name) + "wal/" + entry.key + ".pack",
+    writer,
+    entry.pack_bytes,
+  )
+  let closed = writer.close()
+  // Resolve both the transfer and close before hashing or exposing the file.
+  match closed {
+    .Err(error) => { path.close(); return .Err(error) },
+    .Ok(_) => { },
+  }
+  match downloaded {
+    .Ok(.Found(download)) => {
+      if download.bytes_written != entry.pack_bytes {
+        path.close()
+        return .Err("WAL pack size mismatch")
+      }
+    },
+    .Ok(_) => { path.close(); return .Err("missing WAL pack") },
+    .Err(error) => { path.close(); return .Err(error) },
+  }
+  let checked = inspect(path, entry.pack_bytes)
+  match checked {
+    .Ok(pack) => {
+      if pack.sha256 != entry.pack_sha256 {
+        pack.close()?
+        return .Err("WAL pack integrity mismatch")
+      }
+      .Ok(pack)
+    },
+    .Err(error) => { path.close(); .Err(error) },
+  }
+}
+
+pub fn stage_file(store: Store, name: str, updates: [domain.RefUpdate], pack: Pack) -> Result<str, str> {
+  let key = crypto.uuid()
+  let base = prefix(name) + "wal/" + key
+  let entry = Entry {
+    version: 1,
+    key,
+    updates,
+    pack_bytes: pack.bytes,
+    pack_sha256: pack.sha256,
+    pushed_at: utc_now()?,
+  }
+  match store.upload_file(base + ".pack", pack.spool.path, .Create)? {
+    .Conflict => { return .Err("immutable pack key collision") },
+    .Written(_) => { },
+  }
+  match store.put(base + ".json", entry.to_json().bytes(), .Create)? {
+    .Conflict => .Err("immutable entry key collision"),
+    .Written(_) => .Ok(key),
+  }
+}
+
+fn publish_index(store: Store, name: str, previous: Snapshot, next: Index) -> Result<PutResult, str> {
+  let etag = previous.etag
+  let condition: PutCondition = if etag is nil { .Create } else { .Match(etag) }
+  store.put(prefix(name) + "index.json", next.to_json().bytes(), condition)
+}
+
+/// Caller has already ingested and checked the pack in a disposable bare repo.
+/// Every CAS retry revalidates all old refs against a newly loaded index.
+pub fn publish(
+  store: Store,
+  name: str,
+  updates: [domain.RefUpdate],
+  pack: [int],
+  prepare: fn(Snapshot) -> Result<nil, str>,
+  format: str = "sha1",
+) -> Result<Publication, str> {
+  publish_with(store, name, updates, || stage(store, name, updates, pack), prepare, format)
+}
+
+/// The stage callback is evaluated once, after validation, even when CAS retries.
+pub fn publish_with(
+  store: Store,
+  name: str,
+  updates: [domain.RefUpdate],
+  stage_pack: fn() -> Result<str, str>,
+  prepare: fn(Snapshot) -> Result<nil, str>,
+  format: str = "sha1",
+) -> Result<Publication, str> {
+  validate_updates(updates, format)?
+  var staged: str? = nil
+  for _attempt in 0..8 {
+    let current = load(store, name, format)?
+    if current.index.object_format != format { return .Err("repository object format mismatch") }
+    if is_noop(current.index.refs, updates, format) {
+      return .Ok(Publication { snapshot: current, changed: false })
+    }
+    let refs = apply_updates(current.index.refs, updates, format)?
+    // A concurrent compaction may have removed bases used by a thin pack.
+    // Validate against this exact snapshot on every retry, before its CAS.
+    prepare(current)?
+    let key = staged ?? stage_pack()?
+    staged = key
+    let next = Index {
+      version: 1,
+      entries: current.index.entries.concat([key]),
+      superseded: current.index.superseded,
+      refs,
+      head: choose_head(refs, current.index.head, format),
+      object_format: format,
+    }
+    let publication = match publish_index(store, name, current, next) {
+      .Ok(value) => value,
+      .Err(error) => {
+        // A lost PUT response is ambiguous. Read back the immutable entry ID
+        // before reporting failure; a subsequent compaction may supersede it.
+        let observed = load(store, name, format)?
+        if observed.index.entries.concat(observed.index.superseded).contains(key) {
+          return .Ok(Publication { snapshot: observed, changed: true })
+        }
+        return .Err(error)
+      },
+    }
+    match publication {
+      .Written(etag) => {
+        return .Ok(Publication { snapshot: Snapshot { index: next, etag }, changed: true })
+      },
+      .Conflict => { },
+    }
+  }
+  .Err("WAL publication contention; retry the push")
+}
+
+/// Replace only the verified prefix; concurrent append-only publications survive.
+pub fn compact(
+  store: Store,
+  name: str,
+  base: Snapshot,
+  pack: [int],
+  verify_candidate: fn(Index) -> Result<nil, str>,
+) -> Result<Snapshot, str> {
+  compact_with(store, name, base, |updates| stage(store, name, updates, pack), verify_candidate)
+}
+
+pub fn compact_file(
+  store: Store,
+  name: str,
+  base: Snapshot,
+  pack: Pack,
+  verify_candidate: fn(Index) -> Result<nil, str>,
+) -> Result<Snapshot, str> {
+  compact_with(
+    store,
+    name,
+    base,
+    |updates| stage_file(store, name, updates, pack),
+    verify_candidate,
+  )
+}
+
+fn compact_with(
+  store: Store,
+  name: str,
+  base: Snapshot,
+  stage_pack: fn([domain.RefUpdate]) -> Result<str, str>,
+  verify_candidate: fn(Index) -> Result<nil, str>,
+) -> Result<Snapshot, str> {
+  if base.index.entries.len() < 2 { return .Ok(base) }
+  let updates: [domain.RefUpdate] = []
+  for reference in base.index.refs {
+    updates.push(
+      RefUpdate {
+        name: reference.name,
+        old_oid: zero_oid(base.index.object_format),
+        new_oid: reference.oid,
+      },
+    )
+  }
+  let key = stage_pack(updates)?
+  for _attempt in 0..8 {
+    let current = load(store, name, base.index.object_format)?
+    if current.index.object_format != base.index.object_format {
+      return .Err("repository object format mismatch")
+    }
+    // Array.slice uses an inclusive upper bound.
+    if !equal(current.index.entries.slice(0, base.index.entries.len() - 1), base.index.entries) {
+      return .Ok(current)
+    }
+    let next = Index {
+      version: 1,
+      entries: [key].concat(current.index.entries.slice(base.index.entries.len())),
+      superseded: current.index.superseded.concat(base.index.entries),
+      refs: current.index.refs,
+      head: current.index.head,
+      object_format: current.index.object_format,
+    }
+    // A concurrent thin pack can depend on unreachable objects in the old prefix.
+    // Prove this entire candidate replays from an empty cache before each CAS.
+    verify_candidate(next)?
+    match publish_index(store, name, current, next)? {
+      .Written(etag) => { return .Ok(Snapshot { index: next, etag }) },
+      .Conflict => { },
+    }
+  }
+  load(store, name, base.index.object_format)
+}

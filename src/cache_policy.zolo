@@ -1,0 +1,139 @@
+//! Cache eviction is local maintenance. OS locks protect every mutable repository.
+use std::{fs, os}
+use pack::clean_orphans
+
+pub struct Policy (
+  max_bytes: int = 10737418240,
+  idle_seconds: float = 1800.0,
+  lock_timeout_ms: int = 30000,
+  sweep_seconds: float = 30.0,
+)
+
+pub struct Lease(lock: fs::FileLock, accessed: str) {
+  fn close(self) -> Result<nil, str> {
+    let written = fs.write(self.accessed, "{os.time()}")
+    self.lock.close()?
+    if written is nil { return .Err("cannot record cache access") }
+    .Ok(nil)
+  }
+}
+
+pub fn directory_bytes(path: str) -> Result<int, str> {
+  let entries = fs.list(path)
+  if entries is nil { return .Err("cannot inspect cache directory") }
+  var total = 0
+  for entry in entries {
+    let child = path + "/" + entry
+    let absolute = fs.abs(child)
+    if absolute is nil || !absolute.starts_with(path + "/") && !absolute.starts_with(path + "\\") {
+      return .Err("cache contains a link outside its owned directory")
+    }
+    if fs.is_dir(child) { total += directory_bytes(absolute)? } else {
+      let size = fs.size(child)
+      if size is nil { return .Err("cannot measure cache file") }
+      total += size
+    }
+  }
+  .Ok(total)
+}
+
+fn cache_name(value: str) -> bool {
+  if value.len() != 68 || !value.ends_with(".git") { return false }
+  for byte in value.slice(0, 64).bytes() {
+    if !(byte >= 48 && byte <= 57 || byte >= 97 && byte <= 102) { return false }
+  }
+  true
+}
+
+fn accessed(path: str) -> float {
+  let text: str? = fs.read(path + "/gitwal.access")
+  if text is nil { return 0.0 }
+  text.parse::<float>() recover { _ => 0.0 }
+}
+
+pub struct Candidate(name: str, path: str, bytes: int, accessed_at: float)
+
+/// The maintenance lock only serializes sweepers. A nonblocking repository lock
+/// ensures an active push/fetch is never evicted and avoids lock-order cycles.
+pub fn sweep_cache(root: str, policy: Policy, force: bool = false) -> Result<int, str> {
+  let maintenance = match fs.lock(root + "/.locks/sweep.lock", 0) {
+    .Ok(value) => value,
+    .Err(_) => { return .Ok(0) },
+  }
+  defer maintenance.close()
+  let now = os.time()
+  let previous: str? = fs.read(root + "/.locks/last-sweep")
+  if !force && previous is not nil {
+    let last = match previous.parse::<float>() {
+      .Ok(value) => value,
+      .Err(_) => 0.0,
+    }
+    if now - last < policy.sweep_seconds { return .Ok(0) }
+  }
+  clean_orphans(root + "/.spool")?
+  let names = fs.list(root)
+  if names is nil { return .Err("cannot list cache root") }
+  let candidates: [Candidate] = []
+  var total = 0
+  for name in names {
+    if cache_name(name) {
+      let lease = match fs.lock(root + "/.locks/" + name + ".lock", 0) {
+        .Ok(value) => value,
+        .Err(_) => { continue },
+      }
+      let path = root + "/" + name
+      let absolute = fs.abs(path)
+      if absolute is nil || !(absolute.starts_with(root + "/") || absolute.starts_with(root + "\\")) {
+        lease.close()
+        return .Err("cache path escaped its root")
+      }
+      let measured = directory_bytes(absolute)
+      let accessed_at = accessed(path)
+      lease.close()?
+      let bytes = measured?
+      total += bytes
+      candidates.push(Candidate { name, path, bytes, accessed_at })
+    }
+  }
+  var removed = 0
+  // Choose the oldest eligible directory without holding several repository locks.
+  while candidates.len() > 0 {
+    var oldest = 0
+    for i in 0..candidates.len() {
+      if candidates[i].accessed_at < candidates[oldest].accessed_at { oldest = i }
+    }
+    let candidate = candidates[oldest]
+    candidates.remove_at(oldest)
+    let expired = policy.idle_seconds > 0.0 && now - candidate.accessed_at >= policy.idle_seconds
+    if !expired && (policy.max_bytes == 0 || total <= policy.max_bytes) { continue }
+    let lease = match fs.lock(root + "/.locks/" + candidate.name + ".lock", 0) {
+      .Ok(value) => value,
+      .Err(_) => { continue },
+    }
+    // Recheck access after locking: a request may have completed since the scan.
+    let recent = accessed(candidate.path)
+    if recent <= candidate.accessed_at && fs.exists(candidate.path) {
+      let absolute = fs.abs(candidate.path)
+      if absolute is not nil && (absolute.starts_with(root + "/") || absolute.starts_with(
+        root + "\\",
+      )) {
+        if fs.rmdir(candidate.path, true) is nil {
+          lease.close()?
+          return .Err("cannot evict cache")
+        }
+        total -= candidate.bytes
+        removed += 1
+      }
+    }
+    lease.close()?
+  }
+  if fs.write(root + "/.locks/last-sweep", "{now}") is nil {
+    return .Err("cannot record cache maintenance")
+  }
+  .Ok(removed)
+}
+
+// Keep the imported lease's nominal identity at the lock ownership boundary.
+pub fn acquired_lease(lock: fs::FileLock, accessed: str) -> Lease {
+  Lease { lock, accessed }
+}

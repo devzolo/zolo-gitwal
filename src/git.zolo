@@ -1,0 +1,267 @@
+use cache_policy
+use std::process::{RunOptions}
+//! Stock Git is the object engine. All subprocess arguments are passed without a shell.
+use domain
+use domain::RefUpdate
+use std::{process, fs, hash, stream}
+use object_store::Store
+use domain::{zero_oid, repo_name, tip, apply_updates}
+use wal::{Index, Snapshot, read_entry, read_pack_file}
+use pack::{Pack, temporary, inspect}
+use cache_policy::{Policy, Lease, sweep_cache, acquired_lease}
+
+pub fn cache(root: str, policy: Policy = Policy {  }) -> Cache fails str {
+  if fs.mkdir(root + "/.locks") is nil { fail "cannot create cache root" }
+  if fs.mkdir(root + "/.spool") is nil { fail "cannot create spool directory" }
+  let absolute = fs.abs(root)
+  if absolute is nil { fail "cannot resolve cache root" }
+  Cache { root: absolute, policy }
+}
+
+fn execute(
+  args: [str],
+  input: [int] = [],
+  protocol: str = "",
+  source: stream::Reader? = nil,
+  destination: stream::Writer? = nil,
+  max_bytes: int = 1048576,
+) -> Result<[int], str> {
+  let output = process.run(
+    "git",
+    ["-c", "core.longpaths=true"].concat(args),
+    RunOptions {
+      stdin: if source is nil { input } else { nil },
+      stdin_stream: source,
+      stdout_stream: destination,
+      timeout_ms: 300000,
+      max_output_bytes: max_bytes,
+      max_stderr_bytes: 1048576,
+      env_remove: [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+        "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+        "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_DEFAULT_HASH", "GIT_QUARANTINE_PATH",
+      ],
+      env: #{
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_PROTOCOL: protocol,
+        GIT_CONFIG_COUNT: "0",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "",
+        GIT_NO_REPLACE_OBJECTS: "1",
+      },
+    },
+  )?
+  if output.status != 0 { return .Err("git failed: " + output.stderr.trim()) }
+  .Ok(output.stdout)
+}
+
+fn command(
+  path: str,
+  args: [str],
+  input: [int] = [],
+  protocol: str = "",
+  source: stream::Reader? = nil,
+  destination: stream::Writer? = nil,
+  max_bytes: int = 1048576,
+) -> Result<[int], str> {
+  execute(
+    ["--git-dir=" + path, "-c", "core.hooksPath=" + path + "/disabled-hooks"].concat(args),
+    input,
+    protocol,
+    source,
+    destination,
+    max_bytes,
+  )
+}
+
+fn initialize(path: str, format: str) -> nil fails str {
+  execute(
+    ["init", "--bare", "--object-format=" + format, "--initial-branch=main", "--template=", path],
+  )?
+  command(path, ["config", "gc.auto", "0"])?
+  nil
+}
+
+pub fn ingest(path: str, pack: Pack) -> nil fails str {
+  if pack.bytes == 0 { return nil }
+  let input = pack.reader()?
+  defer input.close()
+  command(path, ["index-pack", "--stdin", "--fix-thin", "--strict"], source: input)?
+  nil
+}
+
+fn transaction(updates: [domain.RefUpdate], commit: bool, format: str) -> str {
+  let lines: [str] = ["start\n"]
+  for update in updates {
+    if update.new_oid == zero_oid(format) {
+      if update.old_oid != zero_oid(format) {
+        lines.push("delete " + update.name + " " + update.old_oid + "\n")
+      }
+    } else {
+      lines.push("update " + update.name + " " + update.new_oid + " " + update.old_oid + "\n")
+    }
+  }
+  lines.push(if commit { "prepare\ncommit\n" } else { "prepare\nabort\n" })
+  lines.join("")
+}
+
+pub fn prepare(path: str, updates: [domain.RefUpdate], format: str = "sha1") -> nil fails str {
+  for update in updates {
+    execute(["check-ref-format", update.name])?
+    if update.new_oid != zero_oid(format) {
+      command(path, ["cat-file", "-e", update.new_oid])?
+      // Walk from each new tip: a valid pack alone does not prove connectivity.
+      command(path, ["rev-list", "--objects", "--missing=error", "--quiet", update.new_oid])?
+    }
+  }
+  command(path, ["update-ref", "--stdin"], transaction(updates, false, format).bytes())?
+  nil
+}
+
+fn apply(path: str, updates: [domain.RefUpdate], format: str) -> nil fails str {
+  command(path, ["update-ref", "--stdin"], transaction(updates, true, format).bytes())?
+  nil
+}
+
+fn write_head(path: str, head: str?) -> nil fails str {
+  command(path, ["symbolic-ref", "HEAD", head ?? "refs/heads/main"])?
+  nil
+}
+
+pub struct Cache(root: str, policy: Policy = Policy {  }) {
+  fn acquire(self, name: str) -> Result<cache_policy.Lease, str> {
+    let path = self.path(name)?
+    let lock = fs.lock(
+      self.root + "/.locks/" + hash.sha256(name) + ".git.lock",
+      self.policy.lock_timeout_ms,
+    )?
+    return .Ok(acquired_lease(lock, path + "/gitwal.access"))
+  }
+  fn sweep(self, force: bool = false) -> Result<int, str> {
+    sweep_cache(self.root, self.policy, force)
+  }
+
+  fn path(self, name: str) -> Result<str, str> {
+    let validated = repo_name(name)?
+    // Hashing avoids case-insensitive filesystem aliases and Windows device names.
+    return .Ok(self.root + "/" + hash.sha256(validated) + ".git")
+  }
+  fn invalidate(self, name: str) -> Result<nil, str> {
+    let marker = self.path(name)? + "/gitwal.etag"
+    if fs.exists(marker) && fs.remove(marker) is nil {
+      return .Err("cannot invalidate cache")
+    }
+    .Ok(nil)
+  }
+
+  /// A nil index always rebuilds: rejected ingestion cannot become hidden state.
+  fn sync(self, store: Store, name: str, snapshot: Snapshot) -> Result<str, str> {
+    let path = self.path(name)?
+    let marker = path + "/gitwal.etag"
+    if snapshot.etag is not nil && fs.exists(path + "/HEAD") && fs.read(marker) == snapshot.etag {
+      return .Ok(path)
+    }
+    // `path` is derived exclusively from this cache's absolute root and a validated flat name.
+    if fs.exists(path) && fs.rmdir(path, true) is nil {
+      return .Err("cannot remove stale cache")
+    }
+    let format = snapshot.index.object_format
+    initialize(path, format)?
+    var refs: [domain.RefTip] = []
+    for key in snapshot.index.entries {
+      let entry = read_entry(store, name, key)?
+      let next = apply_updates(refs, entry.updates, format)?
+      let pack = read_pack_file(store, name, entry, self.root + "/.spool")?
+      defer pack.close()
+      ingest(path, pack)?
+      // Reconstruct the local typed transaction at the decoded WAL boundary.
+      let updates: [RefUpdate] = [for update in entry.updates => RefUpdate {
+        name: update.name, old_oid: update.old_oid, new_oid: update.new_oid,
+      }]
+      apply(path, updates, format)?
+      refs = next
+    }
+    if refs.len() != snapshot.index.refs.len() {
+      return .Err("WAL refs disagree with index")
+    }
+    for reference in refs {
+      if tip(snapshot.index.refs, reference.name, format) != reference.oid {
+        return .Err("WAL refs disagree with index")
+      }
+    }
+    write_head(path, snapshot.index.head)?
+    command(path, ["fsck", "--connectivity-only", "--no-reflogs"])?
+    let etag = snapshot.etag
+    if etag is not nil {
+      if fs.write(marker, etag) is nil { return .Err("cannot checkpoint cache") }
+    }
+    .Ok(path)
+  }
+  fn advertise(self, path: str, protocol: str) -> Result<[int], str> {
+    command(path, ["upload-pack", "--stateless-rpc", "--advertise-refs", path], [], protocol)
+  }
+
+  /// Validate the checkpoint and concurrent tail together without warm objects.
+  fn verify_candidate(self, store: Store, name: str, index: Index) -> Result<nil, str> {
+    let directory = temporary(self.root + "/.spool")?
+    defer directory.close()
+    let isolated = cache(directory.path)?
+    isolated.sync(store, name, Snapshot { index, etag: nil })?
+    .Ok(nil)
+  }
+  fn capture(
+    self,
+    path: str,
+    args: [str],
+    body: [int],
+    protocol: str,
+    max_bytes: int,
+  ) -> Result<Pack, str> {
+    let destination = temporary(self.root + "/.spool")?
+    let writer = match stream.create(destination.path) {
+      .Ok(value) => value,
+      .Err(error) => { destination.close(); return .Err(error) },
+    }
+    let result = command(path, args, body, protocol, destination: writer, max_bytes: max_bytes)
+    let closed = writer.close()
+    match result {
+      .Err(error) => { destination.close(); return .Err(error) },
+      .Ok(_) => { },
+    }
+    match closed {
+      .Err(error) => { destination.close(); return .Err(error) },
+      .Ok(_) => { },
+    }
+    match inspect(destination, max_bytes) {
+      .Ok(pack) => .Ok(pack),
+      .Err(error) => { destination.close(); .Err(error) },
+    }
+  }
+  fn fetch(self, path: str, body: [int], protocol: str, max_bytes: int) -> Result<Pack, str> {
+    self.capture(path, ["upload-pack", "--stateless-rpc", path], body, protocol, max_bytes)
+  }
+  fn verify_pack(self, refs: [domain.RefTip], format: str, pack: Pack) -> Result<nil, str> {
+    let verify = temporary(self.root + "/.spool")?
+    defer verify.close()
+    initialize(verify.path, format)?
+    ingest(verify.path, pack)?
+    let updates: [domain.RefUpdate] = [for reference in refs =>
+      RefUpdate { name: reference.name, old_oid: zero_oid(format), new_oid: reference.oid }]
+    prepare(verify.path, updates, format)
+  }
+  fn compact_pack(self, path: str, refs: [domain.RefTip], format: str, max_bytes: int) -> Result<Pack, str> {
+    let lines = refs.map(|reference| "{reference.oid}\n")
+    let pack = self.capture(
+      path,
+      ["pack-objects", "--revs", "--stdout"],
+      lines.join("").bytes(),
+      "",
+      max_bytes,
+    )?
+    match self.verify_pack(refs, format, pack) {
+      .Ok(_) => .Ok(pack),
+      .Err(error) => { pack.close()?; .Err(error) },
+    }
+  }
+}

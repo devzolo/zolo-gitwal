@@ -1,0 +1,154 @@
+@suite
+mod tests {
+  use domain
+  use domain::RefUpdate
+  use std::{crypto, fs, hex, process, string}
+  use std::http::Request
+  use object_store::{MemoryStore, Store, PutResult}
+  use domain::{ZERO_OID, tip}
+  use git::cache
+  use wal::{Snapshot, publish, load, compact_file}
+  use host::Host
+  use protocol::packet
+
+  // Golden Git v2 SHA-1 packs: three objects each (blob, tree, commit).
+  // The second pack's REF_DELTA requires the first pack's unreachable blob.
+  // Fixed author/committer: Test <test@example.invalid>, 1700000000 +0000.
+  const FIRST: str = "e59064d25fd702f7705aa086097d8b78a5d07688"
+  const SECOND: str = "2b24076014600906b04a1ed457bc953fd1b466cf"
+  const BASE_PACK: str = "5041434b0000000200000003ba01789c2b284a2dcbcc2f2d5628cd2b4a4d4b2d4acd4b4e4d5148cac94f02008f140a53a402789c3334303033315148cbcc49d52ba9286108e3d2ba90f9dca533e451cad9aae2ca94dc039f6d00dde00e829f09789c95cb410ac2301046e17d4e317b4112929214443c841798a97f30d01849a7d2e35ba117f02dbeddd30e500c29a4d1d90c3f416c0e038b2005cf88e2c684c899bd17c3ab3e5ba73b16a58beedeb0717dcf3897d787e7f2b8928bf6884e3fcdd46a2daaf87333c20bcc17809330670913fbef90af126a4263488da76b3e4eae9a9fca"
+  const THIN_PACK: str = "5041434b00000002000000039f09789c958b410a83301000ef79c5de058989c4148af4117e60cd6e6820d16257f1f92af801e730976164618648f1a5adb7a1edc8fbc6f0e8d091d19e385a72265817ce8a0a57f9ce0b0cfc1778cbe90fef587e99eb346d9813f5d074fa06aacb2acca524117eb829c194d501707b304aa402789c3334303033315148cbcc49d52ba92861789c725eeb986a99a7a8df3a8ec62b930d9a8fe93e0400deb50df0fd01560a2ad069e7448954e264cd7a7379646dc0f33c789c9392924acecf4b2e2d2a4acd2b5128c9c8cc534849cd29495448cac94f0200934a0a4e7d80b9fd38c899d5bb6ca030264b28ef57a508a6"
+
+  fn reference(old: str, next: str) -> [domain.RefUpdate] {
+    [RefUpdate { name: "refs/heads/main", old_oid: old, new_oid: next }]
+  }
+
+  fn accepted(_snapshot: Snapshot) -> Result<nil, str> { .Ok(nil) }
+
+  @test
+  fn http_never_acknowledges_failed_wal_writes_and_can_retry() {
+    let root = fs.temp_dir() + "/gitwal-ack-" + crypto.uuid()
+    assert(fs.mkdir(root) is not nil)
+    defer fs.rmdir(root, true)
+    for suffix in [".pack", ".json", "index.json"] {
+      let memory = MemoryStore::create().store()
+      let fail = [true]
+      let store = Store {
+        get_object: |key, etag| memory.get(key, etag),
+        put_object: |key, data, condition| -> Result<PutResult, str> {
+          if fail[0] && key.ends_with(suffix) && (key.contains("/wal/") || key.ends_with(
+            "index.json",
+          )) {
+            return .Err("injected durable write failure")
+          }
+          memory.put(key, data, condition)
+        },
+      }
+      let app = Host {
+        store,
+        cache: cache(root + "/" + crypto.uuid()).unwrap(),
+        compact_after: 0,
+        max_push_bytes: 1048576,
+      }
+      let line = ZERO_OID + " " + FIRST + " refs/heads/main\0report-status atomic\n"
+      let bytes = (packet(line) + "0000").bytes().concat(hex.decode(BASE_PACK))
+      let request = Request {
+        method: "POST",
+        path: "/repo.git/git-receive-pack",
+        full_path: "/repo.git/git-receive-pack",
+        version: "HTTP/1.1",
+        headers: #{
+          authorization: "Bearer zgw_" + "a".repeat_(64),
+          "content-type": "application/x-git-receive-pack-request",
+        },
+        query: #{},
+        params: #{},
+        body: "",
+        body_bytes: bytes,
+      }
+      let refused = app.handle(request)
+      let refusal = string.from_bytes(refused.body_bytes ?? [])
+      assert(refused.status == 200 && refusal.contains("ng refs/heads/main"))
+      assert(!refusal.contains("ok refs/heads/main"))
+      assert(load(memory, "repo").unwrap().index.entries.len() == 0)
+      fail[0] = false
+      let retried = app.handle(request)
+      assert(retried.status == 200)
+      assert(string.from_bytes(retried.body_bytes ?? []).contains("ok refs/heads/main"))
+      assert(tip(load(memory, "repo").unwrap().index.refs, "refs/heads/main") == FIRST)
+    }
+  }
+
+  @test
+  fn lost_publication_reply_is_resolved_by_durable_readback() {
+    let memory = MemoryStore::create().store()
+    let writes = [0]
+    let store = Store {
+      get_object: |key, etag| memory.get(key, etag),
+      put_object: |key, data, condition| -> Result<PutResult, str> {
+        let result = memory.put(key, data, condition)?
+        writes[0] += 1
+        if key.ends_with("index.json") { return .Err("reply lost after committed PUT") }
+        .Ok(result)
+      },
+    }
+    let first = publish(store, "reply", reference(ZERO_OID, FIRST), [255], accepted).unwrap()
+    assert(first.changed)
+    assert(tip(load(memory, "reply").unwrap().index.refs, "refs/heads/main") == FIRST)
+    let retry = publish(store, "reply", reference(ZERO_OID, FIRST), [255], accepted).unwrap()
+    assert(!retry.changed)
+    assert(writes[0] == 3)
+  }
+
+  @test
+  fn compaction_retry_preserves_thin_tail_with_unreachable_historical_base() {
+    let root = fs.temp_dir() + "/gitwal-thin-" + crypto.uuid()
+    assert(fs.mkdir(root) is not nil)
+    defer fs.rmdir(root, true)
+    let memory = MemoryStore::create().store()
+    let base_pack = hex.decode(BASE_PACK)
+    let thin_pack = hex.decode(THIN_PACK)
+    publish(memory, "repo", reference(ZERO_OID, FIRST), base_pack, accepted).unwrap()
+    let base = publish(memory, "repo", reference(FIRST, ZERO_OID), [], accepted).unwrap().snapshot
+    let cached = cache(root + "/warm").unwrap()
+    let path = cached.sync(memory, "repo", base).unwrap()
+    let snapshot_pack = cached.compact_pack(path, base.index.refs, "sha1", 1048576).unwrap()
+    defer snapshot_pack.close()
+    // Confirm the fixture really cannot replay without its historical base.
+    let isolated = MemoryStore::create().store()
+    let missing = publish(isolated, "repo", reference(ZERO_OID, SECOND), thin_pack, accepted).unwrap()
+    assert(cache(root + "/missing").unwrap().sync(isolated, "repo", missing.snapshot).is_err())
+
+    let raced = [false]
+    let conflicts = [0]
+    let store = Store {
+      get_object: |key, etag| memory.get(key, etag),
+      put_object: |key, data, condition| {
+        if key.ends_with("index.json") && !raced[0] {
+          raced[0] = true
+          publish(memory, "repo", reference(ZERO_OID, SECOND), thin_pack, accepted).unwrap()
+        }
+        let result = memory.put(key, data, condition)
+        if let .Ok(.Conflict) = result { conflicts[0] += 1 }
+        result
+      },
+    }
+    let candidate = compact_file(
+      store,
+      "repo",
+      base,
+      snapshot_pack,
+      |index| cached.verify_candidate(memory, "repo", index),
+    )
+    assert(candidate.is_err())
+    assert(raced[0] && conflicts[0] == 1)
+    let durable = load(memory, "repo").unwrap()
+    assert(durable.index.entries.len() == 3)
+    assert(durable.index.superseded.len() == 0)
+    assert(tip(durable.index.refs, "refs/heads/main") == SECOND)
+    let cold = cache(root + "/cold").unwrap().sync(memory, "repo", durable).unwrap()
+    let result = process.run("git", ["--git-dir=" + cold, "show", "HEAD:file.txt"]).unwrap()
+    assert(result.status == 0)
+    assert(string.from_bytes(result.stdout) == "concurrent thin delta blob")
+  }
+}

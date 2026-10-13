@@ -1,0 +1,153 @@
+use std::http::StreamOptions
+//! Run `zolo run src/main.zolo -- token` or configure S3 and run without arguments.
+use std::{os, process, http, hash, stream, fs}
+use object_store::{S3Client, S3Config, CredentialProvider}
+use auth::{new_token, valid_hash, Credential}
+use git::cache
+use host::Host
+use cache_policy::Policy
+use ssh::{serve, pre_receive}
+
+schema CredentialCommand {
+  program: str,
+  args: [str],
+  timeout_ms: int = 30000,
+}
+
+schema HookLauncher {
+  argv: [str],
+}
+
+fn hook_launcher(executable: str) -> [str] {
+  let configured = os.getenv("GITWAL_SSH_LAUNCHER")
+  if configured is not nil {
+    let launcher = match HookLauncher.from_json(r#"{"argv":"# + configured + r#"}"#) {
+      .Ok(value) => value,
+      .Err(_) => { panic("GITWAL_SSH_LAUNCHER must be a JSON array of command arguments") },
+    }
+    if launcher.argv.len() == 0 { panic("GITWAL_SSH_LAUNCHER must not be empty") }
+    return launcher.argv
+  }
+  if executable.ends_with(".zolo") {
+    panic("set GITWAL_SSH_LAUNCHER to the absolute Zolo command for VM SSH hooks")
+  }
+  let absolute: str? = fs.abs(executable)
+  return [absolute ?? panic("set GITWAL_SSH_LAUNCHER to an absolute command path")]
+}
+
+fn credentials() -> CredentialProvider {
+  let provider = os.getenv("GITWAL_CREDENTIAL_PROVIDER") ?? "environment"
+  if provider == "environment" { return CredentialProvider::environment() }
+  if provider == "aws" { return CredentialProvider::aws_profile(os.getenv("AWS_PROFILE")) }
+  if provider == "process" {
+    let command = match CredentialCommand.from_json(required("GITWAL_CREDENTIAL_PROCESS")) {
+      .Ok(value) => value,
+      .Err(_) => { panic("invalid GITWAL_CREDENTIAL_PROCESS JSON") },
+    }
+    return CredentialProvider::process(command.program, command.args, command.timeout_ms).cached()
+  }
+  panic("GITWAL_CREDENTIAL_PROVIDER must be environment, aws or process")
+}
+
+fn required(name: str) -> str {
+  let value = os.getenv(name) ?? ""
+  if value == "" { panic("missing environment variable: " + name) }
+  value
+}
+
+fn number(name: str, fallback: int, low: int, high: int) -> int {
+  let text = os.getenv(name)
+  if text is nil { return fallback }
+  let parsed = text.parse::<int>()
+  if parsed.is_err() { panic("invalid " + name) }
+  let value = parsed.unwrap()
+  if value < low || value > high { panic("invalid " + name) }
+  value
+}
+
+fn main() {
+  let args = process.argv()
+  if args.len() > 1 && (args[1] == "--help" || args[1] == "-h" || args[1] == "help") {
+    print("Usage: zolo-gitwal [token | hash-token | gc | ssh --token-hash HASH | --help]")
+    print("  token       Generate a private repository credential")
+    print("  hash-token  Hash GITWAL_TOKEN for the repository ACL")
+    print("  gc          Evict idle cache entries within GITWAL_CACHE_BYTES")
+    print("  ssh         OpenSSH forced command using an administrator-selected ACL hash")
+    print("  no command  Serve Git Smart HTTP using GITWAL_S3_* and AWS_* settings")
+    return
+  }
+  if args.len() > 1 && args[1] == "token" {
+    let token = new_token()
+    print(token)
+    return
+  }
+  if args.len() > 1 && args[1] == "hash-token" {
+    print(hash.sha256(required("GITWAL_TOKEN")))
+    return
+  }
+  let command = args?.[1] ?? "serve"
+  if command != "serve" && command != "gc" && command != "ssh" && command != "ssh-pre-receive" {
+    panic("unknown command: " + command + "; use --help")
+  }
+  if command == "ssh" && (args.len() != 4 || args[2] != "--token-hash" || !valid_hash(args[3])) {
+    panic("ssh requires --token-hash and the ACL hash assigned by the administrator")
+  }
+  if command == "ssh-pre-receive" && args.len() != 3 {
+    panic("invalid internal SSH hook invocation")
+  }
+  let data = os.getenv("GITWAL_DATA") ?? ".data"
+  let node_cache = cache(
+    data + "/cache",
+    Policy {
+      max_bytes: number("GITWAL_CACHE_BYTES", 10737418240, 0, 5497558138880),
+      idle_seconds: number("GITWAL_CACHE_IDLE_SECONDS", 1800, 0, 31536000) as? float ?? panic(
+        "invalid cache interval",
+      ),
+      lock_timeout_ms: number("GITWAL_CACHE_LOCK_TIMEOUT_MS", 30000, 0, 300000),
+    },
+  ).unwrap()
+  if args.len() > 1 && args[1] == "gc" { print(node_cache.sweep(true).unwrap()); return }
+  let client = S3Client::connect(
+    S3Config {
+      endpoint: required("GITWAL_S3_ENDPOINT"),
+      bucket: required("GITWAL_S3_BUCKET"),
+      region: os.getenv("AWS_REGION") ?? "us-east-1",
+      credential_provider: credentials(),
+      multipart_threshold: number("GITWAL_MULTIPART_THRESHOLD", 67108864, 5242880, 5368709120),
+    },
+  ).unwrap()
+  let format = os.getenv("GITWAL_OBJECT_FORMAT") ?? "sha1"
+  if format != "sha1" && format != "sha256" {
+    panic("GITWAL_OBJECT_FORMAT must be sha1 or sha256")
+  }
+  let app = Host {
+    store: client.store(),
+    cache: node_cache,
+    compact_after: number("GITWAL_COMPACT_AFTER", 32, 0, 100000),
+    max_push_bytes: number("GITWAL_MAX_PUSH_BYTES", 1073741824, 1024, 5497558138880),
+    max_fetch_bytes: number("GITWAL_MAX_FETCH_BYTES", 10737418240, 1024, 5497558138880),
+    object_format: format,
+  }
+  if command == "ssh" || command == "ssh-pre-receive" {
+    let result: Result<int, str> = if command == "ssh" {
+      let presented: Credential = .Token(args[3])
+      serve(app, presented, required("SSH_ORIGINAL_COMMAND"), hook_launcher(args[0]))
+    } else {
+      attempt { pre_receive(app, args[2])?; 0 }
+    }
+    let status = match result {
+      .Ok(value) => value,
+      .Err(error) => { stream.stderr().write("gitwal: {error}\n".bytes()); 1 },
+    }
+    process.exit(status)
+    return
+  }
+  let port = number("GITWAL_PORT", 8080, 1, 65535)
+  print("zolo-gitwal listening on port {port}")
+  http.serve_stream(
+    port,
+    |request: http::Request| app.handle(request),
+    workers: number("GITWAL_WORKERS", 1, 1, 64),
+    options: StreamOptions { max_body_bytes: app.max_push_bytes + 1048576, timeout: 300000 },
+  )
+}

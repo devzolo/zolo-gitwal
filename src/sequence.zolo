@@ -1,0 +1,13 @@
+//! Explicit value comparison: array == compares identity in Zolo.
+pub fn equal<T: core::cmp::Eq>(left: [T], right: [T]) -> bool {
+  if left.len() != right.len() { return false }
+  for index in 0..left.len() { if left[index] != right[index] { return false } }
+  true
+}
+
+@test
+fn compares_values() {
+  assert(equal([0, 255], [0, 255]))
+  assert(!equal([0, 255], [0, 254]))
+  assert(!equal([0], [0, 1]))
+}

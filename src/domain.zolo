@@ -1,0 +1,161 @@
+//! Values crossing the Git/WAL boundary are validated before any publication.
+
+pub const ZERO_OID: str = "0000000000000000000000000000000000000000"
+
+pub fn valid_format(format: str) -> bool { format == "sha1" || format == "sha256" }
+
+pub fn zero_oid(format: str = "sha1") -> str {
+  if format == "sha256" { "0".repeat_(64) } else { ZERO_OID }
+}
+
+pub schema RefTip {
+  name: str,
+  oid: str,
+}
+
+pub schema RefUpdate {
+  name: str,
+  old_oid: str,
+  new_oid: str,
+}
+
+// Construct through the defining module so imported schemas retain their identity.
+pub fn ref_update(name: str, old_oid: str, new_oid: str) -> RefUpdate {
+  RefUpdate { name: name, old_oid: old_oid, new_oid: new_oid }
+}
+
+pub fn valid_oid(value: str, format: str = "sha1") -> bool {
+  if !valid_format(format) { return false }
+  let width = if format == "sha256" { 64 } else { 40 }
+  if value.len() != width { return false }
+  value.bytes().all(_ >= 48 && _ <= 57 || _ >= 97 && _ <= 102)
+}
+
+pub fn repo_name(value: str) -> str fails str {
+  let name = if value.ends_with(".git") { value.slice(0, value.len() - 4) } else { value }
+  if name.len() == 0 || name.len() > 100 || name.starts_with(".") || name.starts_with("-") {
+    fail "invalid repository name"
+  }
+  for byte in name.bytes() {
+    if !(byte >= 97 && byte <= 122 || byte >= 65 && byte <= 90 || byte >= 48 && byte <= 57 || byte == 45 || byte == 95 || byte == 46) {
+      fail "invalid repository name"
+    }
+  }
+  if name.contains("..") { fail "invalid repository name" }
+  name
+}
+
+pub fn valid_ref(name: str) -> bool {
+  if !name.starts_with("refs/") || name.ends_with("/") || name.ends_with(".") || name.contains("..") || name.contains(
+    "//",
+  ) || name.contains("@\{") {
+    return false
+  }
+  for byte in name.bytes() {
+    if byte <= 32 || byte == 127 || byte == 126 || byte == 94 || byte == 58 || byte == 63 || byte == 42 || byte == 91 || byte == 92 {
+      return false
+    }
+  }
+  for part in name.split("/") {
+    if part.starts_with(".") || part.ends_with(".lock") { return false }
+  }
+  true
+}
+
+pub fn tip(refs: [RefTip], name: str, format: str = "sha1") -> str {
+  for reference in refs { if reference.name == name { return reference.oid } }
+  zero_oid(format)
+}
+
+pub fn validate_updates(updates: [RefUpdate], format: str = "sha1") -> nil fails str {
+  let seen: [str] = []
+  for update in updates {
+    if !valid_ref(update.name) || !valid_oid(update.old_oid, format) || !valid_oid(
+      update.new_oid,
+      format,
+    ) {
+      fail "invalid reference transaction"
+    }
+    if seen.contains(update.name) { fail "duplicate reference in transaction" }
+    seen.push(update.name)
+  }
+  nil
+}
+
+pub fn is_noop(refs: [RefTip], updates: [RefUpdate], format: str = "sha1") -> bool {
+  for update in updates { if tip(refs, update.name, format) != update.new_oid { return false } }
+  true
+}
+
+pub fn apply_updates(
+  refs: [RefTip],
+  updates: [RefUpdate],
+  format: str = "sha1",
+) -> [RefTip] fails str {
+  validate_updates(updates, format)?
+  for update in updates {
+    if tip(refs, update.name, format) != update.old_oid {
+      fail "stale reference transaction"
+    }
+  }
+  let replaced = #{for update in updates => [update.name]: true}
+  let retained = refs.filter(|reference| !(replaced[reference.name] ?? false))
+  let inserted: [RefTip] = [for update in updates.filter(_.new_oid != zero_oid(format)) =>
+    RefTip { name: update.name, oid: update.new_oid }]
+  let next = retained.concat(inserted)
+  // Git cannot store both refs/heads/a and refs/heads/a/b.
+  for a in next {
+    for b in next {
+      if a.name != b.name && b.name.starts_with(a.name + "/") {
+        fail "reference directory conflict"
+      }
+    }
+  }
+  next
+}
+
+pub fn choose_head(refs: [RefTip], previous: str?, format: str = "sha1") -> str? {
+  if previous is not nil {
+    if tip(refs, previous, format) != zero_oid(format) { return previous }
+  }
+  if tip(refs, "refs/heads/main", format) != zero_oid(format) { return "refs/heads/main" }
+  for reference in refs { if reference.name.starts_with("refs/heads/") { return reference.name } }
+  nil
+}
+
+@test
+fn names_are_contained() {
+  assert(repo_name("hello.git").unwrap() == "hello")
+  assert(repo_name("../outside").is_err())
+  assert(repo_name("C:/repo").is_err())
+  assert(!valid_ref("refs/heads/a.lock"))
+  assert(!valid_ref("refs/heads/a\n"))
+  assert(valid_ref("refs/heads/topic/test"))
+}
+
+@test
+fn transactions_check_old_values_and_directory_conflicts() {
+  let oid = "1111111111111111111111111111111111111111"
+  let create = [RefUpdate { name: "refs/heads/main", old_oid: ZERO_OID, new_oid: oid }]
+  let refs = apply_updates([], create).unwrap()
+  assert(tip(refs, "refs/heads/main") == oid)
+  assert(is_noop(refs, create))
+  assert(apply_updates(refs, create).is_err())
+  let conflict = [RefUpdate { name: "refs/heads/main/sub", old_oid: ZERO_OID, new_oid: oid }]
+  assert(apply_updates(refs, conflict).is_err())
+  assert(apply_updates([], [create[0], create[0]]).is_err())
+}
+
+@test
+fn object_formats_are_explicit_and_never_mix() {
+  let oid = "a".repeat_(64)
+  assert(valid_oid(oid, "sha256"))
+  assert(!valid_oid(oid))
+  assert(!valid_oid("a".repeat_(40), "sha256"))
+  let create = [RefUpdate { name: "refs/heads/main", old_oid: zero_oid("sha256"), new_oid: oid }]
+  let refs = apply_updates([], create, "sha256").unwrap()
+  assert(choose_head(refs, nil, "sha256") == "refs/heads/main")
+  assert(apply_updates([], create).is_err())
+  let remove = [RefUpdate { name: "refs/heads/main", old_oid: oid, new_oid: zero_oid("sha256") }]
+  assert(apply_updates(refs, remove, "sha256").unwrap().len() == 0)
+}

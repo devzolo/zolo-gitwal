@@ -1,0 +1,288 @@
+//! Inspect the durable RustFS WAL and exercise the real conditional S3 client.
+use std::{os, fs, hash, crypto, process, string}
+use object_store::{S3Config, S3Client, Store, Object, GetResult, PutResult, CredentialProvider}
+use support::checked
+
+schema State {
+  repository: str,
+  token: str,
+  text: str,
+  commit: str,
+}
+
+schema Ref {
+  name: str,
+  oid: str,
+}
+
+schema Update {
+  name: str,
+  old_oid: str,
+  new_oid: str,
+}
+
+schema Index {
+  version: int where |v| v == 1,
+  entries: [str],
+  superseded: [str],
+  refs: [Ref],
+  head: str?,
+  object_format: str = "sha1",
+}
+
+schema Entry {
+  version: int where |v| v == 1,
+  key: str,
+  updates: [Update],
+  pack_bytes: int where |v| v >= 0,
+  pack_sha256: str,
+  pushed_at: str,
+}
+
+// The older process spawn/wait API has dynamic returns. Keep that boundary
+// confined here; test state and storage data use typed values throughout.
+struct Child(pid: int)
+
+struct Completed(stdout: str, stderr: str, status: int)
+
+fn start(args: [str]) -> Child {
+  let executable = process.argv()[0]
+  let child: Child? = if executable.ends_with(".zolo") {
+    process.spawn("zolo", ["run", executable, "--"].concat(args))
+  } else { process.spawn(executable, args) }
+  return child ?? panic("could not launch CAS contender")
+}
+
+fn finish(child: Child) -> Completed {
+  let completed: Completed? = process.wait(child.pid)
+  return completed ?? panic("could not collect CAS contender")
+}
+
+fn required(name: str) -> str {
+  let value = os.getenv(name) ?? ""
+  if value == "" { panic("missing " + name) }
+  return value
+}
+
+fn client() -> S3Client {
+  return checked(
+    S3Client::connect(
+      S3Config {
+        endpoint: required("GITWAL_S3_ENDPOINT"),
+        bucket: required("GITWAL_S3_BUCKET"),
+        region: os.getenv("AWS_REGION") ?? "us-east-1",
+        credential_provider: CredentialProvider::environment(),
+      },
+    ),
+    "connect configured S3 client",
+  )
+}
+
+fn ensure(condition: bool, message: str) {
+  if !condition { panic(message) }
+}
+
+fn found(store: Store, key: str) -> Object {
+  return match checked(store.get(key), "read durable S3 object") {
+    .Found(object) => object,
+    _ => panic("missing durable S3 object: " + key),
+  }
+}
+
+fn written(result: PutResult) -> str {
+  return match result {
+    .Written(etag) => etag,
+    .Conflict => panic("unexpected S3 write conflict"),
+  }
+}
+
+fn multipart_etag(etag: str) -> bool {
+  if !etag.starts_with("\"") || !etag.ends_with("\"") { return false }
+  let parts = etag.slice(1, etag.len() - 1).split("-")
+  if parts.len() != 2 || parts[0] == "" || parts[1] == "" { return false }
+  for byte in parts[0].to_lower().bytes() {
+    if !(byte >= 48 && byte <= 57 || byte >= 97 && byte <= 102) { return false }
+  }
+  for byte in parts[1].bytes() { if byte < 48 || byte > 57 { return false } }
+  return parts[1].bytes()[0] != 48
+}
+
+fn inspect(store: Store, strict: bool) {
+  let path = os.getenv("GITWAL_TEST_STATE") ?? "/state/smoke.json"
+  let state = checked(
+    State.from_json(fs.read(path) ?? panic("cannot read smoke state")),
+    "decode smoke state",
+  )
+  let prefix = "repos/" + state.repository + "/"
+  let index = checked(
+    Index.from_json(string.from_bytes(found(store, prefix + "index.json").data)),
+    "decode durable WAL index",
+  )
+  var current_commit = false
+  for reference in index.refs {
+    if reference.name == "refs/heads/main" && reference.oid == state.commit {
+      current_commit = true
+    }
+  }
+  ensure(current_commit, "durable index does not contain the smoke commit")
+  ensure(index.entries.len() > 0, "durable index has no current WAL entries")
+  var multipart = 0
+  for key in index.entries.concat(index.superseded) {
+    let base = prefix + "wal/" + key
+    let entry = checked(
+      Entry.from_json(string.from_bytes(found(store, base + ".json").data)),
+      "decode durable WAL metadata",
+    )
+    ensure(entry.key == key, "WAL metadata key mismatch")
+    let pack = found(store, base + ".pack")
+    ensure(pack.data.len() == entry.pack_bytes, "WAL pack byte count mismatch")
+    ensure(
+      entry.pack_bytes == 0 || pack.data.len() >= 4 && string.from_bytes(pack.data.slice(0, 3)) == "PACK",
+      "durable WAL object is not a Git pack",
+    )
+    ensure(hash.sha256(pack.data) == entry.pack_sha256, "WAL pack SHA-256 mismatch")
+    if multipart_etag(pack.etag) { multipart += 1 }
+  }
+  print("PASS durable index and WAL pack byte counts and SHA-256 hashes")
+  if !strict { return }
+  ensure(multipart > 0, "no durable WAL pack has an actual multipart ETag")
+  ensure(
+    index.entries.len() == 1 && index.superseded.len() >= 2,
+    "durable index does not evidence compaction of at least two entries",
+  )
+  let snapshot = checked(
+    Entry.from_json(
+      string.from_bytes(found(store, prefix + "wal/" + index.entries[0] + ".json").data),
+    ),
+    "decode compacted snapshot metadata",
+  )
+  ensure(snapshot.updates.len() == index.refs.len(), "compacted snapshot reference count mismatch")
+  let seen: [str] = []
+  for update in snapshot.updates {
+    ensure(!seen.contains(update.name), "compacted snapshot repeats a ref")
+    seen.push(update.name)
+    ensure(
+      update.old_oid == "0".repeat_(if index.object_format == "sha256" { 64 } else { 40 }),
+      "compacted snapshot does not replay from empty refs",
+    )
+    var matched = false
+    for reference in index.refs {
+      if reference.name == update.name && reference.oid == update.new_oid { matched = true }
+    }
+    ensure(matched, "compacted snapshot does not reconstruct current refs")
+  }
+  print("PASS actual multipart ETags and compacted snapshot with superseded history")
+}
+
+fn wait_file(path: str, deadline: float) {
+  while !fs.exists(path) {
+    ensure(process.uptime() < deadline, "CAS contender barrier timed out")
+    process.sleep(10)
+  }
+}
+
+fn contender(store: Store, args: [str]) {
+  ensure(args.len() == 7, "invalid CAS contender arguments")
+  ensure(fs.write(args[5], "ready") is not nil, "cannot signal CAS readiness")
+  wait_file(args[4], process.uptime() + 30.0)
+  match checked(
+    store.put(args[2], args[6].bytes(), .Match(args[3])),
+    "write concurrent CAS contender",
+  ) {
+    .Written(_) => print("written"),
+    .Conflict => print("conflict"),
+  }
+}
+
+fn contracts(connection: S3Client) {
+  let store = connection.store()
+  let prefix = ".gitwal-proof/" + crypto.uuid()
+  let key = prefix + "/binary"
+  defer checked(connection.delete(key), "clean owned binary fixture")
+  ensure(
+    checked(store.get(key), "read fresh binary fixture") == GetResult::Missing,
+    "fresh key was present",
+  )
+  let bytes = [0, 128, 255, 195, 169, 0]
+  let first = written(checked(store.put(key, bytes, .Create), "create binary fixture"))
+  let object = found(store, key)
+  ensure(
+    object.data.join(",") == bytes.join(",") && object.etag == first,
+    "binary roundtrip mismatch",
+  )
+  ensure(
+    checked(store.get(key, first), "read fixture with conditional ETag") == GetResult::NotModified,
+    "conditional GET missed ETag",
+  )
+  ensure(
+    checked(store.put(key, [1], .Create), "attempt duplicate fixture create") == PutResult::Conflict,
+    "create replaced existing key",
+  )
+  ensure(
+    checked(store.put(key, [1], .Match("\"stale\"")), "attempt stale ETag fixture write") == PutResult::Conflict,
+    "stale ETag write succeeded",
+  )
+  let next = written(
+    checked(store.put(key, [], .Match(first)), "write empty fixture with matching ETag"),
+  )
+  ensure(next != first && found(store, key).data.len() == 0, "matched empty write failed")
+  ensure(
+    checked(store.put(key, [2], .Match(first)), "attempt reused ETag fixture write") == PutResult::Conflict,
+    "reused ETag write succeeded",
+  )
+  ensure(store.put(prefix + "/invalid", [256], .Create).is_err(), "invalid byte accepted")
+  ensure(
+    checked(store.get(prefix + "/invalid"), "read rejected invalid-byte fixture") == GetResult::Missing,
+    "invalid bytes published",
+  )
+  ensure(store.get(prefix + "/../escape").is_err(), "dot-only key segment accepted")
+  checked(connection.delete(key), "delete owned binary fixture")
+  ensure(
+    checked(store.get(key), "read deleted binary fixture") == GetResult::Missing,
+    "deleted key remained readable",
+  )
+  checked(connection.delete(key), "repeat idempotent fixture delete")
+  print("PASS real S3 binary/empty roundtrip, conditional reads, create and stale/matched writes")
+
+  let race = prefix + "/race"
+  defer checked(connection.delete(race), "clean owned CAS fixture")
+  let etag = written(
+    checked(store.put(race, "initial".bytes(), .Create), "create CAS race fixture"),
+  )
+  let directory = (os.getenv("TMPDIR") ?? os.getenv("TEMP") ?? "/tmp") + "/gitwal-cas-" + crypto.uuid()
+  ensure(fs.mkdir(directory) is not nil, "cannot create CAS barrier directory")
+  defer fs.rmdir(directory, true)
+  let gate = directory + "/release"
+  let one = start(["contender", race, etag, gate, directory + "/one", "contender-one"])
+  defer process.kill(one.pid)
+  let two = start(["contender", race, etag, gate, directory + "/two", "contender-two"])
+  defer process.kill(two.pid)
+  let deadline = process.uptime() + 30.0
+  wait_file(directory + "/one", deadline)
+  wait_file(directory + "/two", deadline)
+  ensure(fs.write(gate, "go") is not nil, "cannot release CAS contenders")
+  let first_outcome = finish(one)
+  let second_outcome = finish(two)
+  ensure(first_outcome.status == 0 && second_outcome.status == 0, "CAS contender failed")
+  let first_result = first_outcome.stdout.trim()
+  let second_result = second_outcome.stdout.trim()
+  ensure(
+    first_result == "written" && second_result == "conflict" || first_result == "conflict" && second_result == "written",
+    "CAS race did not produce one winner and one conflict",
+  )
+  let winner = if first_result == "written" { "contender-one" } else { "contender-two" }
+  ensure(
+    string.from_bytes(found(store, race).data) == winner,
+    "CAS winner contents were not durable",
+  )
+  print("PASS concurrent same-ETag CAS: one winner, one conflict, winning contents durable")
+}
+
+fn main() {
+  let args = process.argv()
+  let connection = client()
+  if args.len() > 1 && args[1] == "contender" { contender(connection.store(), args); return }
+  ensure(args.len() == 1 || args.len() == 2 && args[1] == "strict", "usage: storage [strict]")
+  inspect(connection.store(), args.len() == 2)
+  contracts(connection)
+}

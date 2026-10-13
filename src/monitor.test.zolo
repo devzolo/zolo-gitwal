@@ -1,0 +1,34 @@
+@suite
+mod tests {
+  use monitor::{page, view}
+
+  @test
+  fn connection_form_has_accessible_controls_and_no_initial_secret() {
+    let ui = mount(view())
+    expect(ui.get_by_label("Repository")).to_have_attr("required")
+    expect(ui.get_by_label("Repository")).to_have_attr("maxlength", "100")
+    expect(ui.get_by_label("Repository")).to_have_attr("spellcheck", "false")
+    expect(ui.get_by_placeholder("zgw_…")).to_have_attr("type", "password")
+    expect(ui.get_by_placeholder("zgw_…")).to_have_attr("autocomplete", "off")
+    expect(ui.get_by_placeholder("zgw_…")).not.to_have_attr("value")
+    expect(ui.get_by_role("button", "Open repository")).to_be_enabled()
+    expect(ui.get_by_role("status")).to_have_attr("aria-live", "polite")
+    expect(ui.get_by_role("columnheader", "Reference")).to_have_attr("scope", "col")
+  }
+
+  @test
+  fn rendered_monitor_preserves_transport_and_browser_policy() {
+    let response = page()
+    assert(response.status == 200)
+    assert(response.headers["content-type"] == "text/html; charset=utf-8")
+    assert(response.headers["cache-control"] == "no-store")
+    assert(response.headers["referrer-policy"] == "no-referrer")
+    let policy = response.headers["content-security-policy"] ?? ""
+    assert(policy.contains("connect-src 'self'"))
+    assert(policy.contains("frame-ancestors 'none'"))
+    assert(!policy.contains("unsafe-eval"))
+    assert(response.body.to_lower().starts_with("<!doctype html>"))
+    assert(response.body.contains("data-zolo-css"))
+    assert(!response.body.contains("&lt;script"))
+  }
+}

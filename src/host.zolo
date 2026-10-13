@@ -1,0 +1,286 @@
+//! Application policy. Transport code never decides the WAL operation order.
+use std::{http, stream, string}
+use object_store::Store
+use domain::{repo_name, apply_updates, is_noop}
+use protocol::{PushRequest, packet, read_push, advertise_receive, report}
+use auth::{Credential, AccessConfig, credential, load_meta, can_push, can_fetch, claim, configure}
+use wal::{Snapshot, load, publish_with, stage_file, compact_file}
+use pack::{Pack, spool}
+use git::{Cache, ingest, prepare}
+use monitor_page::page
+
+fn git_response(service: str, body: [int], discovery: bool = false) -> http::Response {
+  let kind = if discovery { "advertisement" } else { "result" }
+  http.response_bytes(
+    200,
+    body,
+    #{
+      "content-type": "application/x-" + service + "-" + kind,
+      "cache-control": "no-store",
+    },
+  )
+}
+
+fn refusal(status: int, text: str) -> http::Response {
+  http.response(status, text + "\n", #{"content-type": "text/plain", "cache-control": "no-store"})
+}
+
+fn body_reader(request: http::Request) -> Result<stream::Reader, str> {
+  let reader = request.body_stream
+  if reader is not nil { return .Ok(reader) }
+  stream.from_bytes(request.body_bytes)
+}
+
+fn small_body(request: http::Request, limit: int) -> Result<[int], str> {
+  let reader = body_reader(request)?
+  defer reader.close()
+  let bytes: [int] = []
+  loop {
+    let chunk = reader.read()?
+    if chunk.len() == 0 { break }
+    if bytes.len() + chunk.len() > limit { return .Err("request body exceeds configured limit") }
+    for byte in chunk { bytes.push(byte) }
+  }
+  .Ok(bytes)
+}
+
+fn git_file(service: str, pack: Pack) -> http::Response {
+  match pack.transfer() {
+    .Ok(reader) => http.response_stream(
+      200,
+      reader,
+      #{
+        "content-type": "application/x-" + service + "-result",
+        "cache-control": "no-store",
+      },
+      pack.bytes,
+    ),
+    .Err(_) => { pack.close(); refusal(503, "cannot open Git response") },
+  }
+}
+
+pub struct Host (
+  store: Store,
+  cache: Cache,
+  compact_after: int,
+  max_push_bytes: int,
+  object_format: str = "sha1",
+  max_fetch_bytes: int = 10737418240,
+) {
+  fn validate(
+    self,
+    name: str,
+    snapshot: Snapshot,
+    push: PushRequest,
+    pack: Pack,
+  ) -> Result<nil, str> {
+    apply_updates(snapshot.index.refs, push.updates, snapshot.index.object_format)?
+    let path = self.cache.sync(self.store, name, snapshot)?
+    self.cache.invalidate(name)?
+    ingest(path, pack)?
+    prepare(path, push.updates, snapshot.index.object_format)
+  }
+
+  fn push(
+    self,
+    name: str,
+    presented: Credential,
+    push: PushRequest,
+    pack: Pack,
+    format: str,
+  ) -> Result<nil, str> {
+    match presented {
+      .Token(_) => { },
+      _ => { return .Err("valid bearer token required; run zolo-gitwal token") },
+    }
+    let existing = load_meta(self.store, name)?
+    if existing is not nil {
+      if !can_push(existing.meta, presented) { return .Err("access denied") }
+    }
+    let initial = load(self.store, name, format)?
+    if !is_noop(initial.index.refs, push.updates, format) {
+      self.validate(name, initial, push, pack)?
+    }
+    let owned = claim(self.store, name, presented, format)?
+    if !can_push(owned.meta, presented) { return .Err("access denied") }
+    let result = publish_with(
+      self.store,
+      name,
+      push.updates,
+      || stage_file(self.store, name, push.updates, pack),
+      |snapshot| self.validate(name, snapshot, push, pack),
+      format,
+    )?
+    // The CAS above is the commit point. Everything below is recoverable maintenance.
+    if result.changed && self.compact_after > 0 && result.snapshot.index.entries.len() >= self.compact_after {
+      match self.maintenance(name, result.snapshot) {
+        .Ok(_) => { },
+        .Err(error) => {
+          stream.stderr().write("gitwal: compaction deferred for {name}: {error}\n".bytes());
+        },
+      }
+    }
+    .Ok(nil)
+  }
+
+  fn maintenance(self, name: str, snapshot: Snapshot) -> Result<nil, str> {
+    let path = self.cache.sync(self.store, name, snapshot)?
+    let pack = self.cache.compact_pack(
+      path,
+      snapshot.index.refs,
+      snapshot.index.object_format,
+      self.max_fetch_bytes,
+    )?
+    defer pack.close()
+    compact_file(
+      self.store,
+      name,
+      snapshot,
+      pack,
+      |index| self.cache.verify_candidate(self.store, name, index),
+    )?
+    .Ok(nil)
+  }
+  fn handle(self, request: http::Request) -> http::Response {
+    if request.method == "GET" && request.path == "/healthz" { return http.ok("ok\n") }
+    if request.method == "GET" && request.path == "/" {
+      return page()
+    }
+    let segments = request.path.split("/")
+    if segments.len() < 3 { return refusal(404, "not found") }
+    let name = repo_name(segments[1]) recover {
+        _ => return refusal(404, "not found"),
+      }
+    let lease = match self.cache.acquire(name) {
+        .Ok(value) => value,
+        .Err(_) => { return refusal(503, "repository cache is busy; retry") },
+      }
+    defer self.cache.sweep()
+    defer lease.close()
+    let presented = credential(request.headers["authorization"])
+    let route = segments.slice(2).join("/")
+    let service = request.query["service"] ?? ""
+    let discovery = request.method == "GET" && route == "info/refs"
+    let receive = discovery && service == "git-receive-pack" || request.method == "POST" && route == "git-receive-pack"
+    let fetch = discovery && service == "git-upload-pack" || request.method == "POST" && route == "git-upload-pack"
+    if !receive && !fetch && route != "config" && route != "monitor" {
+      return refusal(404, "not found")
+    }
+    if receive && discovery {
+      match presented {
+        .Token(_) => { },
+        _ => { return refusal(403, "valid bearer token required") },
+      }
+    }
+    let metadata = match load_meta(self.store, name) {
+        .Ok(value) => value,
+        .Err(_) => { return refusal(503, "metadata unavailable") },
+      }
+    let format = if metadata is nil { self.object_format } else { metadata.meta.object_format }
+    if receive {
+      if metadata is not nil {
+        if !can_push(metadata.meta, presented) { return refusal(403, "access denied") }
+      }
+      if discovery {
+        return match load(self.store, name, format) {
+          .Ok(snapshot) => git_response(
+            "git-receive-pack",
+            advertise_receive(
+              snapshot.index.refs,
+              snapshot.index.head,
+              snapshot.index.object_format,
+            ).bytes(),
+            true,
+          ),
+          .Err(_) => refusal(503, "WAL unavailable"),
+        }
+      }
+      if request.headers["content-type"] != "application/x-git-receive-pack-request" {
+        return refusal(415, "expected Git receive-pack content type")
+      }
+      let reader = match body_reader(request) {
+        .Ok(value) => value,
+        .Err(error) => { return refusal(400, error) },
+      }
+      defer reader.close()
+      let push = match read_push(reader, format) {
+        .Ok(value) => value,
+        .Err(error) => { return refusal(400, error) },
+      }
+      if push.updates.len() == 0 { return git_response("git-receive-pack", []) }
+      let pack = match spool(reader, self.cache.root + "/.spool", self.max_push_bytes) {
+        .Ok(value) => value,
+        .Err(error) => { return refusal(413, error) },
+      }
+      defer pack.close()
+      let failure: str? = match self.push(name, presented, push, pack, format) {
+        .Ok(_) => nil,
+        .Err(error) => error,
+      }
+      return git_response("git-receive-pack", report(push, failure).bytes())
+    }
+    if metadata is nil { return refusal(404, "not found") }
+    let meta = metadata.meta
+    if !can_fetch(meta, presented) { return refusal(404, "not found") }
+    if route == "config" {
+      if !can_push(meta, presented) { return refusal(403, "access denied") }
+      if request.method == "GET" {
+        return http.response(
+          200,
+          meta.to_json(),
+          #{"content-type": "application/json", "cache-control": "no-store"},
+        )
+      }
+      if request.method != "PUT" { return refusal(405, "method not allowed") }
+      let body = match small_body(request, 65536) {
+        .Ok(value) => string.from_bytes(value),
+        .Err(error) => { return refusal(413, error) },
+      }
+      let decoded: Result<AccessConfig, str> = AccessConfig.from_json(body)
+      let config = match decoded {
+        .Ok(value) => value,
+        .Err(error) => { return refusal(400, "{error}") },
+      }
+      return match configure(self.store, name, presented, config) {
+        .Ok(_) => http.no_content(),
+        .Err(error) => refusal(409, error),
+      }
+    }
+    let snapshot = match load(self.store, name, format) {
+        .Ok(value) => value,
+        .Err(_) => { return refusal(503, "WAL unavailable") },
+      }
+    if route == "monitor" {
+      if request.method != "GET" { return refusal(405, "method not allowed") }
+      return http.response(
+        200,
+        snapshot.index.to_json(),
+        #{"content-type": "application/json", "cache-control": "no-store"},
+      )
+    }
+    let path = self.cache.sync(self.store, name, snapshot) recover {
+        _ => return refusal(503, "cache reconstruction failed"),
+      }
+    let protocol = request.headers["git-protocol"] ?? ""
+    if discovery {
+      return match self.cache.advertise(path, protocol) {
+        .Ok(body) => git_response(
+          "git-upload-pack",
+          (packet("# service=git-upload-pack\n") + "0000").bytes().concat(body),
+          true,
+        ),
+        .Err(_) => refusal(503, "Git advertisement failed"),
+      }
+    }
+    if request.headers["content-type"] != "application/x-git-upload-pack-request" {
+      return refusal(415, "expected Git upload-pack content type")
+    }
+    let body = small_body(request, 1048576) recover {
+        error => return refusal(413, error),
+      }
+    match self.cache.fetch(path, body, protocol, self.max_fetch_bytes) {
+      .Ok(pack) => git_file("git-upload-pack", pack),
+      .Err(_) => refusal(503, "Git fetch failed"),
+    }
+  }
+}

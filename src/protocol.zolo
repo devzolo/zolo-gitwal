@@ -1,0 +1,163 @@
+//! Git pkt-line framing. Binary pack bytes never pass through a string.
+use domain
+use domain::RefUpdate
+use std::{string, stream}
+use domain::{ZERO_OID, zero_oid, validate_updates}
+use sequence::equal
+
+pub struct PushRequest(updates: [domain.RefUpdate], capabilities: [str])
+
+pub struct BufferedPush(request: PushRequest, pack: [int])
+
+fn hex_digit(byte: int) -> int {
+  if byte >= 48 && byte <= 57 { return byte - 48 }
+  if byte >= 97 && byte <= 102 { return byte - 87 }
+  if byte >= 65 && byte <= 70 { return byte - 55 }
+  return -1
+}
+
+pub fn packet(payload: str) -> str {
+  let digits = "0123456789abcdef"
+  let size = payload.bytes().len() + 4
+  assert(size <= 65520)
+  var header = ""
+  for shift in [12, 8, 4, 0] {
+    let digit = size >> shift & 15
+    header = header + digits.slice(digit, digit + 1)
+  }
+  header + payload
+}
+
+pub fn parse_push(body: [int], format: str = "sha1") -> BufferedPush fails str {
+  let updates: [domain.RefUpdate] = []
+  var capabilities: [str] = []
+  var offset = 0
+  loop {
+    if offset > 1048576 { fail "command section exceeds 1 MiB" }
+    if offset + 4 > body.len() { fail "truncated packet header" }
+    var size = 0
+    for i in 0..4 {
+      let digit = hex_digit(body[offset + i])
+      if digit < 0 { fail "invalid packet length" }
+      size = size * 16 + digit
+    }
+    if size == 0 { offset = offset + 4; break }
+    if size < 4 || size > 65520 || offset + size > body.len() {
+      fail "truncated or invalid packet"
+    }
+    // Array.slice uses an inclusive upper bound; pkt-line sizes count bytes.
+    let raw = body.slice(offset + 4, offset + size - 1)
+    // Commands are UTF-8; a replacement character must never create a different ref.
+    let line = string.from_bytes(raw)
+    if !equal(line.bytes(), raw) { fail "command is not UTF-8" }
+    // Git permits a final LF; other trailing whitespace belongs to the ref.
+    let command = if line.ends_with("\n") { line.slice(0, line.len() - 1) } else { line }
+    let sections = command.split("\0")
+    if sections.len() > 2 || sections.len() > 1 && updates.len() > 0 {
+      fail "capabilities only allowed on first command"
+    }
+    let fields = sections[0].split(" ")
+    if fields.len() != 3 || fields.join(" ") != sections[0] { fail "expected old oid, new oid and ref" }
+    let (old_oid, new_oid, name) = (fields[0], fields[1], fields[2])
+    updates.push(RefUpdate { name: name, old_oid: old_oid, new_oid: new_oid })
+    if sections.len() == 2 { capabilities = sections[1].split(" ") }
+    offset = offset + size
+  }
+  validate_updates(updates, format)?
+  for capability in capabilities {
+    if capability.starts_with("object-format=") && capability != "object-format=" + format {
+      fail "repository object format mismatch"
+    }
+  }
+  if capabilities.contains("push-options") || capabilities.contains("push-cert") {
+    fail "unsupported push extension"
+  }
+  BufferedPush { request: PushRequest { updates, capabilities }, pack: body.slice(offset) }
+}
+
+pub fn read_exact(reader: stream::Reader, count: int) -> [int] fails str {
+  var bytes: [int] = []
+  while bytes.len() < count {
+    let part = reader.read(count - bytes.len())?
+    if part.len() == 0 { fail "truncated packet" }
+    bytes = bytes.concat(part)
+  }
+  bytes
+}
+
+/// Read only bounded command pkt-lines. The reader remains at the first pack byte.
+pub fn read_push(reader: stream::Reader, format: str = "sha1") -> PushRequest fails str {
+  var commands: [int] = []
+  loop {
+    let header = read_exact(reader, 4)?
+    var size = 0
+    for byte in header {
+      let digit = hex_digit(byte)
+      if digit < 0 { fail "invalid packet length" }
+      size = size * 16 + digit
+    }
+    commands = commands.concat(header)
+    if commands.len() > 1048576 { fail "command section exceeds 1 MiB" }
+    if size == 0 { break }
+    if size < 4 || size > 65520 { fail "invalid packet length" }
+    if commands.len() + size - 4 > 1048576 { fail "command section exceeds 1 MiB" }
+    commands = commands.concat(read_exact(reader, size - 4)?)
+  }
+  let parsed = parse_push(commands, format)?
+  return parsed.request
+}
+
+pub fn advertise_receive(refs: [domain.RefTip], head: str?, format: str = "sha1") -> str {
+  var result = packet("# service=git-receive-pack\n") + "0000"
+  var caps = "report-status delete-refs side-band-64k atomic ofs-delta object-format={format} agent=zolo-gitwal/0.2"
+  if head is not nil { caps = caps + " symref=HEAD:" + head }
+  if refs.len() == 0 {
+    return result + packet(zero_oid(format) + " capabilities^\{\}\0" + caps + "\n") + "0000"
+  }
+  var first = true
+  for reference in refs {
+    let suffix = if first { "\0" + caps } else { "" }
+    result = result + packet(reference.oid + " " + reference.name + suffix + "\n")
+    first = false
+  }
+  result + "0000"
+}
+
+pub fn report(push: PushRequest, failure: str?) -> str {
+  var body = packet("unpack ok\n")
+  for update in push.updates {
+    body = body + packet(
+      if failure is nil { "ok " + update.name + "\n" } else {
+        "ng " + update.name + " " + (failure ?? "rejected").replace("\n", " ") + "\n"
+      },
+    )
+  }
+  body = body + "0000"
+  if !push.capabilities.contains("side-band-64k") { return body }
+  var framed = ""
+  var offset = 0
+  while offset < body.len() {
+    let end = if offset + 60000 < body.len() { offset + 60000 } else { body.len() }
+    framed = framed + packet(string.from_bytes([1]) + body.slice(offset, end))
+    offset = end
+  }
+  framed + "0000"
+}
+
+@test
+fn preserves_pack_bytes_and_rejects_bad_commands() {
+  let oid = "1111111111111111111111111111111111111111"
+  let command = packet(ZERO_OID + " " + oid + " refs/heads/main\0report-status\n") + "0000"
+  let binary = b"PACK\x00\xff\x80".bytes()
+  let push = parse_push(command.bytes().concat(binary)).unwrap()
+  assert(push.request.updates.len() == 1)
+  assert(equal(push.pack, [80, 65, 67, 75, 0, 255, 128]))
+  assert(parse_push("0003".bytes()).is_err())
+  assert(parse_push("zzzz".bytes()).is_err())
+  assert(parse_push("0010short".bytes()).is_err())
+  assert(parse_push("0000".bytes()).unwrap().request.updates.len() == 0)
+  for suffix in [" ", "\t", "\r"] {
+    let malformed = packet(ZERO_OID + " " + oid + " refs/heads/main" + suffix + "\n") + "0000"
+    assert(parse_push(malformed.bytes()).is_err())
+  }
+}

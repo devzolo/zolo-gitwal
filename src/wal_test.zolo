@@ -1,0 +1,130 @@
+use object_store::{MemoryStore, Store, PutResult}
+use domain::{ZERO_OID, tip, ref_update}
+use wal::{Snapshot, load, publish, compact, read_entry, read_pack, prefix}
+
+fn accepted(_snapshot: Snapshot) -> Result<nil, str> { .Ok(nil) }
+
+fn oid_a() -> str { "1".repeat_(40) }
+fn oid_b() -> str { "2".repeat_(40) }
+
+@test
+fn publication_is_durable_and_exact_redelivery_writes_nothing() {
+  let memory = MemoryStore::create().store()
+  let writes = [0]
+  let store = Store {
+    get_object: |key, etag| memory.get(key, etag),
+    put_object: |key, data, condition| {
+      writes[0] += 1
+      memory.put(key, data, condition)
+    },
+  }
+  let refs = [ref_update("refs/heads/main", ZERO_OID, oid_a())]
+  let first = publish(store, "repo", refs, [0, 255, 128], accepted).unwrap()
+  assert(first.changed)
+  assert(writes[0] == 3)
+  let entry = read_entry(store, "repo", first.snapshot.index.entries[0]).unwrap()
+  assert(read_pack(store, "repo", entry).unwrap().len() == 3)
+  let second = publish(store, "repo", refs, [0, 255, 128], accepted).unwrap()
+  assert(!second.changed)
+  assert(writes[0] == 3)
+  assert(publish(store, "repo", [ref_update("refs/heads/main", ZERO_OID, oid_b())], [], accepted).is_err())
+  assert(writes[0] == 3)
+}
+
+@test
+fn failed_object_writes_never_publish_references() {
+  for suffix in [".pack", ".json", "index.json"] {
+    let memory = MemoryStore::create().store()
+    let store = Store {
+      get_object: |key, etag| memory.get(key, etag),
+      put_object: |key, data, condition| -> Result<PutResult, str> {
+        if key.ends_with(suffix) { return .Err("injected storage failure") }
+        memory.put(key, data, condition)
+      },
+    }
+    assert(publish(store, "repo", [ref_update("refs/heads/main", ZERO_OID, oid_a())], [255], accepted).is_err())
+    assert(load(memory, "repo").unwrap().index.entries.len() == 0)
+  }
+}
+
+@test
+fn cas_conflict_revalidates_before_retry_and_preserves_competing_refs() {
+  let memory = MemoryStore::create().store()
+  let race = [true]
+  let validations = [0]
+  let store = Store {
+    get_object: |key, etag| memory.get(key, etag),
+    put_object: |key, data, condition| {
+      if key.ends_with("index.json") && race[0] {
+        race[0] = false
+        publish(memory, "repo", [ref_update("refs/heads/other", ZERO_OID, oid_b())], [], accepted).unwrap()
+      }
+      memory.put(key, data, condition)
+    },
+  }
+  let result = publish(
+    store,
+    "repo",
+    [ref_update("refs/heads/main", ZERO_OID, oid_a())],
+    [],
+    |_snapshot| -> Result<nil, str> {
+      validations[0] += 1
+      return .Ok(nil)
+    },
+  ).unwrap()
+  assert(validations[0] == 2)
+  assert(result.snapshot.index.entries.len() == 2)
+  assert(tip(result.snapshot.index.refs, "refs/heads/other") == oid_b())
+  assert(tip(result.snapshot.index.refs, "refs/heads/main") == oid_a())
+}
+
+@test
+fn compaction_preserves_concurrent_appends_and_history() {
+  let store = MemoryStore::create().store()
+  publish(store, "repo", [ref_update("refs/heads/main", ZERO_OID, oid_a())], [], accepted).unwrap()
+  let base = publish(store, "repo", [ref_update("refs/heads/main", oid_a(), oid_b())], [], accepted).unwrap().snapshot
+  publish(store, "repo", [ref_update("refs/tags/v1", ZERO_OID, oid_a())], [], accepted).unwrap()
+  let compacted = compact(store, "repo", base, [], |_index| -> Result<nil, str> { return .Ok(nil) }).unwrap()
+  assert(compacted.index.entries.len() == 2)
+  assert(compacted.index.superseded.len() == 2)
+  assert(tip(compacted.index.refs, "refs/tags/v1") == oid_a())
+  let raced = compact(store, "repo", base, [], |_index| -> Result<nil, str> { return .Ok(nil) }).unwrap()
+  assert(raced.etag == compacted.etag)
+}
+
+@test
+fn failed_candidate_replay_never_replaces_the_index() {
+  let store = MemoryStore::create().store()
+  publish(store, "repo", [ref_update("refs/heads/main", ZERO_OID, oid_a())], [], accepted).unwrap()
+  let base = publish(store, "repo", [ref_update("refs/heads/main", oid_a(), oid_b())], [], accepted).unwrap().snapshot
+  let result = compact(
+    store,
+    "repo",
+    base,
+    [],
+    |_index| -> Result<nil, str> { return .Err("missing thin pack base") },
+  )
+  assert(result.is_err())
+  assert(load(store, "repo").unwrap().etag == base.etag)
+}
+
+@test
+fn corrupt_pack_is_rejected_before_replay() {
+  let store = MemoryStore::create().store()
+  let published = publish(store, "repo", [ref_update("refs/heads/main", ZERO_OID, oid_a())], [1], accepted).unwrap()
+  let key = published.snapshot.index.entries[0]
+  let entry = read_entry(store, "repo", key).unwrap()
+  let object_key = prefix("repo") + "wal/" + key + ".pack"
+  match store.get(object_key).unwrap() {
+    .Found(object) => { store.put(object_key, [2], .Match(object.etag)).unwrap() },
+    _ => panic("missing pack"),
+  }
+  assert(read_pack(store, "repo", entry).is_err())
+}
+
+@test
+fn corrupt_index_returns_an_error_before_domain_validation() {
+  let store = MemoryStore::create().store()
+  store.put(prefix("repo") + "index.json", "\{".bytes(), .Create).unwrap()
+  assert(load(store, "repo").is_err())
+}

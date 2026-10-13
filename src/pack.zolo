@@ -1,0 +1,113 @@
+//! Owned spool files keep Git validation and signed uploads bounded in memory.
+use std::{stream, fs, hash, crypto, os}
+
+pub struct Spool(path: str, lock: fs::FileLock) {
+  fn close(self) -> Result<nil, str> {
+    let removed = if fs.is_dir(self.path) { fs.rmdir(self.path, true) } else {
+      if fs.exists(self.path) { fs.remove(self.path) } else { true }
+    }
+    self.release()?
+    if removed is nil { return .Err("cannot remove spool") }
+    .Ok(nil)
+  }
+  fn release(self) -> Result<nil, str> {
+    self.lock.close()?
+    fs.remove(self.path + ".lock")
+    .Ok(nil)
+  }
+}
+
+pub struct Pack(spool: Spool, bytes: int, sha256: str) {
+  fn reader(self) -> Result<stream::Reader, str> { stream.open(self.spool.path) }
+  fn close(self) -> Result<nil, str> { self.spool.close() }
+  /// Transfer the open file to HTTP. Its last reader closes and removes it.
+  fn transfer(self) -> Result<stream::Reader, str> {
+    let reader = stream.open(self.spool.path, true)?
+    self.spool.release()?
+    return .Ok(reader)
+  }
+}
+
+pub fn temporary(directory: str) -> Spool fails str {
+  if fs.mkdir(directory) is nil { fail "cannot create spool directory" }
+  let path = directory + "/{os.time()}_" + crypto.uuid() + ".tmp"
+  let lock = fs.lock(path + ".lock", 0)?
+  return Spool { path, lock }
+}
+
+pub fn inspect(spool: Spool, max_bytes: int) -> Pack fails str {
+  let bytes = fs.size(spool.path)
+  if bytes is nil { fail "cannot inspect pack spool" }
+  if bytes > max_bytes { fail "pack exceeds configured size limit" }
+  let sha256 = hash.sha256_file(spool.path, max_bytes)?
+  return Pack { spool, bytes, sha256 }
+}
+
+pub fn spool(reader: stream::Reader, directory: str, max_bytes: int) -> Result<Pack, str> {
+  let temporary = temporary(directory)?
+  let writer = match stream.create(temporary.path) {
+    .Ok(value) => value,
+    .Err(error) => { temporary.close(); return .Err(error) },
+  }
+  let copied = stream.copy_to(reader, writer, max_bytes)
+  let closed = writer.close()
+  match copied {
+    .Err(error) => { temporary.close(); return .Err(error) },
+    .Ok(_) => { },
+  }
+  match closed {
+    .Err(error) => { temporary.close(); return .Err(error) },
+    .Ok(_) => { },
+  }
+  match inspect(temporary, max_bytes) {
+    .Ok(pack) => .Ok(pack),
+    .Err(error) => { temporary.close(); .Err(error) },
+  }
+}
+
+fn owned_name(name: str) -> bool {
+  if !name.ends_with(".tmp") { return false }
+  let parts = name.slice(0, name.len() - 4).split("_")
+  if parts.len() != 2 || (parts[0].parse::<float>()).is_err() || parts[1].len() != 36 {
+    return false
+  }
+  for i in 0..36 {
+    let byte = parts[1].bytes()[i]
+    if i == 8 || i == 13 || i == 18 || i == 23 {
+      if byte != 45 { return false }
+    } else if !(byte >= 48 && byte <= 57 || byte >= 97 && byte <= 102) { return false }
+  }
+  true
+}
+
+/// Unique names are never reused. A live OS lock protects transfers of any age;
+/// the grace period also covers responses whose file ownership moved to HTTP.
+pub fn clean_orphans(directory: str, grace_seconds: float = 600.0) -> Result<int, str> {
+  let names = fs.list(directory)
+  if names is nil { return .Err("cannot inspect spool directory") }
+  let now = os.time()
+  let mut removed = 0
+  let seen: #{str: bool} = #{}
+  for item in names {
+    let name: str = if item.ends_with(".lock") { item.slice(0, item.len() - 5) } else { item }
+    if !owned_name(name) { continue }
+    if seen[name] ?? false { continue }
+    seen[name] = true
+    let created = match name.split("_")[0].parse::<float>() {
+      .Ok(value) => value,
+      .Err(_) => { continue },
+    }
+    if now - created < grace_seconds { continue }
+    let path = directory + "/" + name
+    let lock = match fs.lock(path + ".lock", 0) {
+      .Ok(value) => value,
+      .Err(_) => { continue },
+    }
+    let temporary = Spool { path, lock }
+    match temporary.close() {
+      .Ok(_) => { removed += 1 },
+      .Err(_) => { },
+    }
+  }
+  .Ok(removed)
+}

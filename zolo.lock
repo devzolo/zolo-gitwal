@@ -1,0 +1,9 @@
+version = 3
+
+[[package]]
+name = "object_store"
+version = "0.1.2"
+source = "git+https://github.com/devzolo/zolo-object-store.git#628f679552d86768af724ccfd2f823413d758e78"
+source_origin = "git+https://github.com/devzolo/zolo-object-store.git#628f679552d86768af724ccfd2f823413d758e78"
+content = "blake3:aa8992c43204b435aa85617318c825996af7c8a5fcfe6a8f7c205a32eac763e0"
+dependencies = []

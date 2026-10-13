@@ -1,0 +1,14 @@
+[project]
+name = "zolo-gitwal"
+version = "0.1.0"
+entry = "src/main.zolo"
+
+[compiler]
+type_check = "standard"
+
+[formatter]
+indent_size = 2
+max_line_width = 100
+
+[dependencies]
+object_store = { git = "https://github.com/devzolo/zolo-object-store.git", rev = "628f679552d86768af724ccfd2f823413d758e78" }

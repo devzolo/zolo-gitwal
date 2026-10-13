@@ -1,0 +1,10 @@
+/target/
+/.zolo/
+/.data/
+*.log
+.env
+.env.*
+!.env.example
+
+# Private local working data; never included in the public source.
+/teste.json

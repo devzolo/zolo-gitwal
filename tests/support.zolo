@@ -1,0 +1,7 @@
+//! Assert a successful fixture operation without printing credentials from errors.
+pub fn checked<T, E>(result: Result<T, E>, operation: str) -> T {
+  match result {
+    .Ok(value) => value,
+    .Err(_) => panic("FAIL " + operation),
+  }
+}

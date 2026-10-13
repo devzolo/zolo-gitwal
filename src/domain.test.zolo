@@ -1,0 +1,20 @@
+//! Boundary tables use independent cases, with inputs visible in the runner.
+use domain::{repo_name, valid_oid, valid_ref}
+
+test "repository names reject paths and option injection" for name in [
+  "", "../outside", "C:/repo", "-option", ".hidden", "a..b", "a/b", "a\\b",
+] {
+  assert(repo_name(name).is_err())
+}
+
+test "object IDs require the selected format" for (format, width) in [("sha1", 40), ("sha256", 64)] {
+  assert(valid_oid("a".repeat_(width), format))
+  assert(!valid_oid("a".repeat_(width - 1), format))
+  assert(!valid_oid("g".repeat_(width), format))
+}
+
+test "references reject Git metacharacters" for name in [
+  "refs/heads/a.lock", "refs/heads/a..b", "refs/heads/a?", "refs/heads/a\n",
+] {
+  assert(!valid_ref(name))
+}

@@ -1,0 +1,69 @@
+@suite
+mod tests {
+  use std::{fs, crypto, stream}
+  use git::cache
+  use pack::{temporary, clean_orphans, spool}
+
+  fn fixture() -> str {
+    let root = fs.temp_dir() + "/gitwal-cache-test-" + crypto.uuid()
+    assert(fs.mkdir(root) is not nil)
+    let absolute: str? = fs.abs(root)
+    absolute ?? panic("cannot resolve test directory")
+  }
+
+  fn entry(root: str, name: str, accessed: str) {
+    let cached = cache(root).unwrap()
+    let path = cached.path(name).unwrap()
+    assert(fs.mkdir(path) is not nil)
+    assert(fs.write(path + "/objects", "x".repeat_(100)) is not nil)
+    assert(fs.write(path + "/gitwal.access", accessed) is not nil)
+  }
+
+  @test
+  fn cache_budget_evicts_oldest_completed_repository() {
+    let root = fixture()
+    defer fs.rmdir(root, true)
+    let cached = cache(root, Policy { max_bytes: 150, idle_seconds: 0.0 }).unwrap()
+    entry(root, "older", "100")
+    entry(root, "newer", "200")
+    assert(cached.sweep(true).unwrap() == 1)
+    assert(!fs.exists(cached.path("older").unwrap()))
+    assert(fs.exists(cached.path("newer").unwrap()))
+  }
+
+  @test
+  fn active_repository_is_never_evicted_until_lease_closes() {
+    let root = fixture()
+    defer fs.rmdir(root, true)
+    let cached = cache(root, Policy { max_bytes: 1, idle_seconds: 0.0 }).unwrap()
+    entry(root, "active", "100")
+    entry(root, "idle", "200")
+    let lease = cached.acquire("active").unwrap()
+    assert(cached.sweep(true).unwrap() == 1)
+    assert(fs.exists(cached.path("active").unwrap()))
+    assert(!fs.exists(cached.path("idle").unwrap()))
+    lease.close().unwrap()
+    assert(cached.sweep(true).unwrap() == 1)
+    assert(!fs.exists(cached.path("active").unwrap()))
+  }
+
+  @test
+  fn orphan_cleanup_skips_live_transfers_and_reclaims_abandoned_spools() {
+    let root = fixture()
+    defer fs.rmdir(root, true)
+    let input = stream.from_bytes([0, 255, 1, 128]).unwrap()
+    defer input.close()
+    let pack = spool(input, root, 4).unwrap()
+    assert(clean_orphans(root, 0.0).unwrap() == 0)
+    assert(fs.exists(pack.spool.path))
+    pack.close().unwrap()
+    let abandoned = temporary(root).unwrap()
+    let writer = stream.create(abandoned.path).unwrap()
+    writer.write([9, 8, 7]).unwrap()
+    writer.close().unwrap()
+    abandoned.release().unwrap()
+    assert(clean_orphans(root, 0.0).unwrap() == 1)
+    assert(!fs.exists(abandoned.path))
+    assert(clean_orphans(root, 0.0).unwrap() == 0)
+  }
+}

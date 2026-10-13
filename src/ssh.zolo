@@ -1,0 +1,293 @@
+use std::process::{RunOptions}
+//! OpenSSH forced commands use stock Git and publish in the pre-receive hook.
+use domain
+use domain::RefUpdate
+use std::{fs, os, process, stream, string}
+use auth::{Credential, load_meta, can_fetch, can_push}
+use domain::{repo_name, validate_updates}
+use git::cache
+use host::Host
+use pack::{Pack, temporary, spool}
+use protocol::PushRequest
+use wal::load
+use sequence::equal
+
+pub struct Command(service: str, name: str)
+
+// This is a grammar, not a shell parser. Git's usual single quoted flat name
+// is accepted; escapes, paths, options and additional arguments are rejected.
+pub fn parse_command(original: str) -> Command fails str {
+  let separator = original.index_of(" ")
+  if separator < 0 { fail "expected a Git SSH command" }
+  let service = original.slice(0, separator)
+  if service != "git-upload-pack" && service != "git-receive-pack" {
+    fail "unsupported SSH command"
+  }
+  let argument = original.slice(separator + 1, original.len())
+  let name = if argument.starts_with("'") && argument.ends_with("'") && argument.len() >= 2 {
+    argument.slice(1, argument.len() - 1)
+  } else { argument }
+  return Command { service, name: repo_name(name)? }
+}
+
+schema Session {
+  version: int where |v| v == 1,
+  name: str,
+  repository: str,
+  object_format: str where |v| v == "sha1" || v == "sha256",
+  token_digest: str,
+}
+
+fn quote(value: str) -> str { "'" + value.replace("'", "'\"'\"'") + "'" }
+
+fn realpath(path: str) -> str fails str {
+  let absolute = fs.abs(path)
+  if absolute is nil { fail "cannot resolve SSH session path" }
+  return absolute
+}
+
+fn child(service: str, repository: str, hooks: str, max_bytes: int) -> Result<int, str> {
+  let output = process.run(
+    "git",
+    [
+      "-c", "core.hooksPath=" + hooks,
+      "-c", "receive.unpackLimit=0",
+      "-c", "receive.maxInputSize={max_bytes}",
+      "-c", "receive.fsckObjects=true",
+      "-c", "receive.advertiseAtomic=true",
+      "-c", "gc.auto=0",
+      if service == "git-upload-pack" { "upload-pack" } else { "receive-pack" },
+      repository,
+    ],
+    RunOptions {
+      inherit_stdin: true,
+      inherit_stdout: true,
+      inherit_stderr: true,
+      timeout_ms: 300000,
+      max_output_bytes: 1048576,
+      max_stderr_bytes: 1048576,
+      env_remove: [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+        "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+        "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_DEFAULT_HASH",
+        "GIT_PROTOCOL", "GIT_QUARANTINE_PATH",
+      ],
+      env: #{
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_CONFIG_COUNT: "0",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "",
+        GIT_NO_REPLACE_OBJECTS: "1",
+      },
+    },
+  )?
+  return .Ok(output.status)
+}
+
+/// `presented` and `launcher` come from administrator configuration, never
+/// SSH_ORIGINAL_COMMAND, AcceptEnv or an environment negotiated by the client.
+pub fn serve(app: Host, presented: Credential, original: str, launcher: [str]) -> Result<int, str> {
+  let command = parse_command(original)?
+  let metadata = load_meta(app.store, command.name)?
+  let receiving = command.service == "git-receive-pack"
+  if receiving {
+    match presented {
+      .Token(_) => { },
+      _ => { return .Err("valid SSH principal required") },
+    }
+    if metadata is not nil && !can_push(metadata.meta, presented) { return .Err("access denied") }
+  } else {
+    if metadata is nil { return .Err("repository not found") }
+    if !can_fetch(metadata.meta, presented) { return .Err("access denied") }
+  }
+  let format = if metadata is nil { app.object_format } else { metadata.meta.object_format }
+  let snapshot = load(app.store, command.name, format)?
+  let directory = temporary(app.cache.root + "/.spool")?
+  defer directory.close()
+  if fs.mkdir(directory.path) is nil { return .Err("cannot create SSH session") }
+  fs.chmod(directory.path, 448)?
+  let isolated = cache(directory.path)?
+  let repository = isolated.sync(app.store, command.name, snapshot)?
+  let hooks = directory.path + "/hooks"
+  if fs.mkdir(hooks) is nil { return .Err("cannot create SSH hooks") }
+  fs.chmod(hooks, 448)?
+  if receiving {
+    if launcher.len() == 0 { return .Err("missing trusted SSH hook launcher") }
+    let digest = match presented {
+      .Token(value) => value,
+      _ => { return .Err("valid SSH principal required") },
+    }
+    let session = Session {
+      version: 1,
+      name: command.name,
+      repository,
+      object_format: format,
+      token_digest: digest,
+    }
+    let session_path = directory.path + "/session.json"
+    if fs.write(session_path, session.to_json()) is nil { return .Err("cannot write SSH session") }
+    fs.chmod(session_path, 384)?
+    let arguments: [str] = []
+    for argument in launcher { arguments.push(quote(argument)) }
+    arguments.push("ssh-pre-receive")
+    arguments.push(quote(session_path))
+    let hook = hooks + "/pre-receive"
+    if fs.write(hook, "#!/bin/sh\nexec " + arguments.join(" ") + "\n") is nil {
+      return .Err("cannot write SSH hook")
+    }
+    fs.chmod(hook, 448)?
+  }
+  child(command.service, repository, hooks, app.max_push_bytes)
+}
+
+fn updates(reader: stream::Reader, format: str) -> Result<[domain.RefUpdate], str> {
+  var bytes: [int] = []
+  loop {
+    let part = reader.read()?
+    if part.len() == 0 { break }
+    if bytes.len() + part.len() > 1048576 { return .Err("reference transaction exceeds 1 MiB") }
+    bytes = bytes.concat(part)
+  }
+  let text = string.from_bytes(bytes)
+  if !equal(text.bytes(), bytes) { return .Err("reference transaction is not UTF-8") }
+  if text.len() == 0 || !text.ends_with("\n") { return .Err("invalid pre-receive transaction") }
+  let result: [domain.RefUpdate] = []
+  for line in text.slice(0, text.len() - 1).split("\n") {
+    let fields = line.split(" ")
+    if fields.len() != 3 || fields.join(" ") != line {
+      return .Err("invalid pre-receive transaction")
+    }
+    result.push(RefUpdate { name: fields[2], old_oid: fields[0], new_oid: fields[1] })
+  }
+  validate_updates(result, format)?
+  return .Ok(result)
+}
+
+fn empty_pack(app: Host) -> Result<Pack, str> {
+  let empty = stream.from_bytes([])?
+  defer empty.close()
+  spool(empty, app.cache.root + "/.spool", app.max_push_bytes)
+}
+
+fn incoming(app: Host, session: Session) -> Result<Pack, str> {
+  let quarantine = os.getenv("GIT_QUARANTINE_PATH")
+  if quarantine is nil || quarantine == "" { return empty_pack(app) }
+  let objects = realpath(session.repository + "/objects")?
+  let absolute = realpath(quarantine)?
+  if !absolute.starts_with(objects + "/") && !absolute.starts_with(objects + "\\") {
+    return .Err("Git quarantine is outside the SSH session")
+  }
+  let pack_directory = absolute + "/pack"
+  if !fs.exists(pack_directory) { return empty_pack(app) }
+  let entries = fs.list(pack_directory)
+  if entries is nil { return .Err("missing Git quarantine pack directory") }
+  let packs: [str] = []
+  for entry in entries {
+    if entry.starts_with("pack-") && entry.ends_with(".pack") { packs.push(entry) }
+  }
+  // A ref-only push may leave an empty quarantine. Host.push still proves that
+  // every referenced object is reachable from the authoritative WAL cache.
+  if packs.len() == 0 { return empty_pack(app) }
+  if packs.len() != 1 { return .Err("expected exactly one quarantined Git pack") }
+  let path = realpath(pack_directory + "/" + packs[0])?
+  if !path.starts_with(absolute + "/") && !path.starts_with(absolute + "\\") {
+    return .Err("Git quarantine pack escapes the SSH session")
+  }
+  let reader = stream.open(path)?
+  defer reader.close()
+  // Own only this copy. Git still needs its quarantine pack after the hook.
+  spool(reader, app.cache.root + "/.spool", app.max_push_bytes)
+}
+
+pub fn pre_receive(app: Host, session_path: str) -> Result<nil, str> {
+  let path = realpath(session_path)?
+  let owned = realpath(app.cache.root + "/.spool")?
+  if !path.starts_with(owned + "/") && !path.starts_with(owned + "\\") {
+    return .Err("SSH session is outside the owned spool")
+  }
+  let size = fs.size(path)
+  if size is nil || size > 65536 { return .Err("invalid SSH session size") }
+  let text = fs.read(path)
+  if text is nil { return .Err("cannot read SSH session") }
+  let session = Session.from_json(text)?
+  repo_name(session.name)?
+  if session.token_digest.len() != 64 { return .Err("invalid SSH principal") }
+  for byte in session.token_digest.bytes() {
+    if !(byte >= 48 && byte <= 57 || byte >= 97 && byte <= 102) {
+      return .Err("invalid SSH principal")
+    }
+  }
+  let repository = realpath(session.repository)?
+  if !path.ends_with("/session.json") && !path.ends_with("\\session.json") {
+    return .Err("invalid SSH session path")
+  }
+  let directory = path.slice(0, path.len() - "/session.json".len())
+  if !repository.starts_with(directory + "/") && !repository.starts_with(directory + "\\") {
+    return .Err("repository is outside the SSH session")
+  }
+  let input = stream.stdin()
+  let transaction = updates(input, session.object_format)?
+  let presented: Credential = .Token(session.token_digest)
+  let pack = incoming(app, session)?
+  defer pack.close()
+  let lease = app.cache.acquire(session.name)?
+  defer app.cache.sweep()
+  defer lease.close()
+  // Host.push refreshes ACLs and revalidates against the authoritative WAL.
+  // The hook exits zero only after durable index publication succeeds.
+  app.push(
+    session.name,
+    presented,
+    PushRequest { updates: transaction, capabilities: [] },
+    pack,
+    session.object_format,
+  )
+}
+
+@test
+fn forced_command_has_no_shell_language() {
+  assert(parse_command("git-upload-pack 'demo.git'").unwrap().name == "demo")
+  assert(parse_command("git-receive-pack demo").unwrap().service == "git-receive-pack")
+  for command in [
+    "sh -c id", "git-upload-pack '../outside.git'", "git-upload-pack '/demo.git'",
+    "git-upload-pack '--help'", "git-upload-pack demo.git extra", "git-upload-pack demo;id",
+    "git-upload-pack 'demo.git';id", "git-upload-pack \"demo.git\"", "git-upload-pack 'de'mo'",
+    "git-upload-pack  demo", "git-upload-pack demo\n", "git-receive-pack demo$(id)",
+  ] { assert(parse_command(command).is_err()) }
+}
+
+@test
+fn pre_receive_transactions_are_strict() {
+  let old = "0".repeat_(40)
+  let next = "a".repeat_(40)
+  let good = stream.from_bytes((old + " " + next + " refs/heads/main\n").bytes()).unwrap()
+  defer good.close()
+  assert(updates(good, "sha1").unwrap().len() == 1)
+  for malformed in [
+    "", old + " " + next + " refs/heads/main", old + " " + next + " refs/heads/main \n",
+    old + " " + next + " refs/heads/main\r\n", old + "  " + next + " refs/heads/main\n",
+    old + " " + next + " ../escape\n",
+    (old + " " + next + " refs/heads/main\n").repeat_(2),
+  ] {
+    let reader = stream.from_bytes(malformed.bytes()).unwrap()
+    defer reader.close()
+    assert(updates(reader, "sha1").is_err())
+  }
+}
+
+@test
+fn pre_receive_transactions_are_bounded() {
+  let oversized = stream.from_bytes("x".repeat_(1048577).bytes()).unwrap()
+  defer oversized.close()
+  assert(updates(oversized, "sha1").is_err())
+}
+
+@test
+fn pre_receive_transactions_support_sha256() {
+  let sha256 = stream.from_bytes(
+    ("0".repeat_(64) + " " + "a".repeat_(64) + " refs/heads/main\n").bytes(),
+  ).unwrap()
+  defer sha256.close()
+  assert(updates(sha256, "sha256").unwrap().len() == 1)
+}

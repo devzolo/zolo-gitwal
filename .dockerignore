@@ -1,0 +1,12 @@
+**
+!Dockerfile
+!zolo.toml
+!zolo.lock
+!src/
+!src/**
+!docker/
+!docker/**
+!tests/
+!tests/*.zolo
+!tools/
+!tools/**
