@@ -3,6 +3,7 @@ use std::process::{RunOptions}
 //! Stock Git is the object engine. All subprocess arguments are passed without a shell.
 use domain
 use domain::RefUpdate
+use domain::RefTip
 use std::{process, fs, hash, stream}
 use object_store::Store
 use domain::{zero_oid, repo_name, tip, apply_updates, present}
@@ -91,7 +92,7 @@ pub fn ingest(path: str, pack: Pack) -> nil fails str {
   nil
 }
 
-fn transaction(updates: [domain.RefUpdate], commit: bool, format: str) -> str {
+fn transaction(updates: [RefUpdate], commit: bool, format: str) -> str {
   let lines: [str] = ["start\n"]
   for update in updates {
     if update.new_oid == zero_oid(format) {
@@ -106,7 +107,7 @@ fn transaction(updates: [domain.RefUpdate], commit: bool, format: str) -> str {
   lines.join("")
 }
 
-pub fn prepare(path: str, updates: [domain.RefUpdate], format: str = "sha1") -> nil fails str {
+pub fn prepare(path: str, updates: [RefUpdate], format: str = "sha1") -> nil fails str {
   for update in updates {
     execute(["check-ref-format", update.name])?
     if update.new_oid != zero_oid(format) {
@@ -119,7 +120,7 @@ pub fn prepare(path: str, updates: [domain.RefUpdate], format: str = "sha1") -> 
   nil
 }
 
-fn apply(path: str, updates: [domain.RefUpdate], format: str) -> nil fails str {
+fn apply(path: str, updates: [RefUpdate], format: str) -> nil fails str {
   command(path, ["update-ref", "--stdin"], transaction(updates, true, format).bytes())?
   nil
 }
@@ -168,7 +169,7 @@ pub struct Cache(root: str, policy: Policy = Policy {  }) {
     }
     let format = snapshot.index.object_format
     initialize(path, format)?
-    var refs: [domain.RefTip] = []
+    var refs: [RefTip] = []
     for key in snapshot.index.entries {
       let entry = read_entry(store, name, key)?
       let next = apply_updates(refs, entry.updates, format)?
@@ -241,16 +242,16 @@ pub struct Cache(root: str, policy: Policy = Policy {  }) {
   fn fetch(self, path: str, body: [int], protocol: str, max_bytes: int) -> Result<Pack, str> {
     self.capture(path, ["upload-pack", "--stateless-rpc", path], body, protocol, max_bytes)
   }
-  fn verify_pack(self, refs: [domain.RefTip], format: str, pack: Pack) -> Result<nil, str> {
+  fn verify_pack(self, refs: [RefTip], format: str, pack: Pack) -> Result<nil, str> {
     let verify = temporary(self.root + "/.spool")?
     defer verify.close()
     initialize(verify.path, format)?
     ingest(verify.path, pack)?
-    let updates: [domain.RefUpdate] = [for reference in refs =>
+    let updates: [RefUpdate] = [for reference in refs =>
       RefUpdate { name: reference.name, old_oid: zero_oid(format), new_oid: reference.oid }]
     prepare(verify.path, updates, format)
   }
-  fn compact_pack(self, path: str, refs: [domain.RefTip], format: str, max_bytes: int) -> Result<Pack, str> {
+  fn compact_pack(self, path: str, refs: [RefTip], format: str, max_bytes: int) -> Result<Pack, str> {
     let lines = refs.map(|reference| "{reference.oid}\n")
     let pack = self.capture(
       path,

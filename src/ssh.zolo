@@ -141,7 +141,7 @@ pub fn serve(app: Host, presented: Credential, original: str, launcher: [str]) -
   child(command.service, repository, hooks, app.max_push_bytes)
 }
 
-fn updates(reader: stream::Reader, format: str) -> Result<[domain.RefUpdate], str> {
+fn updates(reader: stream::Reader, format: str) -> Result<[RefUpdate], str> {
   var bytes: [int] = []
   loop {
     let part = reader.read()?
@@ -152,7 +152,7 @@ fn updates(reader: stream::Reader, format: str) -> Result<[domain.RefUpdate], st
   let text = string.from_bytes(bytes)
   if !equal(text.bytes(), bytes) { return .Err("reference transaction is not UTF-8") }
   if text.len() == 0 || !text.ends_with("\n") { return .Err("invalid pre-receive transaction") }
-  let result: [domain.RefUpdate] = []
+  let result: [RefUpdate] = []
   for line in text.slice(0, text.len() - 1).split("\n") {
     let fields = line.split(" ")
     if fields.len() != 3 || fields.join(" ") != line {

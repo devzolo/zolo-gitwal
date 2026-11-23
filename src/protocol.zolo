@@ -1,11 +1,12 @@
 //! Git pkt-line framing. Binary pack bytes never pass through a string.
 use domain
 use domain::RefUpdate
+use domain::RefTip
 use std::{string, stream}
 use domain::{ZERO_OID, zero_oid, validate_updates}
 use sequence::equal
 
-pub struct PushRequest(pub updates: [domain.RefUpdate], pub capabilities: [str])
+pub struct PushRequest(pub updates: [RefUpdate], pub capabilities: [str])
 
 pub struct BufferedPush(request: PushRequest, pack: [int])
 
@@ -29,7 +30,7 @@ pub fn packet(payload: str) -> str {
 }
 
 pub fn parse_push(body: [int], format: str = "sha1") -> BufferedPush fails str {
-  let updates: [domain.RefUpdate] = []
+  let updates: [RefUpdate] = []
   var capabilities: [str] = []
   var offset = 0
   loop {
@@ -107,7 +108,7 @@ pub fn read_push(reader: stream::Reader, format: str = "sha1") -> PushRequest fa
   return parsed.request
 }
 
-pub fn advertise_receive(refs: [domain.RefTip], head: str?, format: str = "sha1") -> str {
+pub fn advertise_receive(refs: [RefTip], head: str?, format: str = "sha1") -> str {
   var result = packet("# service=git-receive-pack\n") + "0000"
   var caps = "report-status delete-refs side-band-64k atomic ofs-delta object-format={format} agent=zolo-gitwal/0.2"
   if head is not nil { caps = caps + " symref=HEAD:" + head }

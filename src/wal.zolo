@@ -1,6 +1,7 @@
 //! Immutable packs + metadata, published by a single conditional index write.
 use domain
 use domain::RefUpdate
+use domain::RefTip
 use std::{crypto, hash, os, string, stream}
 use object_store::{Store, PutCondition, PutResult}
 use domain::{
@@ -14,7 +15,7 @@ pub schema Index {
   version: int where |v| v == 1,
   entries: [str],
   superseded: [str],
-  refs: [domain.RefTip],
+  refs: [RefTip],
   head: str?,
   object_format: str where |v| v == "sha1" || v == "sha256" = "sha1",
 }
@@ -22,7 +23,7 @@ pub schema Index {
 pub schema Entry {
   version: int where |v| v == 1,
   key: str,
-  updates: [domain.RefUpdate],
+  updates: [RefUpdate],
   pack_bytes: int where |v| v >= 0,
   pack_sha256: str,
   pushed_at: str,
@@ -130,7 +131,7 @@ pub fn read_pack(store: Store, name: str, entry: Entry) -> Result<[int], str> {
   }
 }
 
-fn stage(store: Store, name: str, updates: [domain.RefUpdate], pack: [int]) -> Result<str, str> {
+fn stage(store: Store, name: str, updates: [RefUpdate], pack: [int]) -> Result<str, str> {
   let key = crypto.uuid()
   let base = prefix(name) + "wal/" + key
   let entry = Entry {
@@ -191,7 +192,7 @@ pub fn read_pack_file(store: Store, name: str, entry: Entry, directory: str) -> 
   }
 }
 
-pub fn stage_file(store: Store, name: str, updates: [domain.RefUpdate], pack: Pack) -> Result<str, str> {
+pub fn stage_file(store: Store, name: str, updates: [RefUpdate], pack: Pack) -> Result<str, str> {
   let key = crypto.uuid()
   let base = prefix(name) + "wal/" + key
   let entry = Entry {
@@ -223,7 +224,7 @@ fn publish_index(store: Store, name: str, previous: Snapshot, next: Index) -> Re
 pub fn publish(
   store: Store,
   name: str,
-  updates: [domain.RefUpdate],
+  updates: [RefUpdate],
   pack: [int],
   prepare: fn(Snapshot) -> Result<nil, str>,
   format: str = "sha1",
@@ -235,7 +236,7 @@ pub fn publish(
 pub fn publish_with(
   store: Store,
   name: str,
-  updates: [domain.RefUpdate],
+  updates: [RefUpdate],
   stage_pack: fn() -> Result<str, str>,
   prepare: fn(Snapshot) -> Result<nil, str>,
   format: str = "sha1",
@@ -315,11 +316,11 @@ fn compact_with(
   store: Store,
   name: str,
   base: Snapshot,
-  stage_pack: fn([domain.RefUpdate]) -> Result<str, str>,
+  stage_pack: fn([RefUpdate]) -> Result<str, str>,
   verify_candidate: fn(Index) -> Result<nil, str>,
 ) -> Result<Snapshot, str> {
   if base.index.entries.len() < 2 { return .Ok(base) }
-  let updates: [domain.RefUpdate] = []
+  let updates: [RefUpdate] = []
   for reference in base.index.refs {
     updates.push(
       RefUpdate {
