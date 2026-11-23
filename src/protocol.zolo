@@ -5,7 +5,7 @@ use std::{string, stream}
 use domain::{ZERO_OID, zero_oid, validate_updates}
 use sequence::equal
 
-pub struct PushRequest(updates: [domain.RefUpdate], capabilities: [str])
+pub struct PushRequest(pub updates: [domain.RefUpdate], pub capabilities: [str])
 
 pub struct BufferedPush(request: PushRequest, pack: [int])
 

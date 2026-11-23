@@ -28,7 +28,7 @@ pub schema Entry {
   pushed_at: str,
 }
 
-pub struct Snapshot(index: Index, etag: str?)
+pub struct Snapshot(pub index: Index, pub etag: str?)
 
 pub struct Publication(snapshot: Snapshot, changed: bool)
 

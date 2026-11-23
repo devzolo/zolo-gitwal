@@ -1,13 +1,14 @@
 //! Owned spool files keep Git validation and signed uploads bounded in memory.
 use std::{stream, fs, hash, crypto, os}
+use domain::present
 
 pub struct Spool(path: str, lock: fs::FileLock) {
   fn close(self) -> Result<nil, str> {
-    let removed = if fs.is_dir(self.path) { fs.rmdir(self.path, true) } else {
-      if fs.exists(self.path) { fs.remove(self.path) } else { true }
+    let removed = if fs.is_dir(self.path) { fs.rmdir(self.path, true).is_ok() } else {
+      if fs.exists(self.path) { fs.remove(self.path).is_ok() } else { true }
     }
     self.release()?
-    if removed is nil { return .Err("cannot remove spool") }
+    if !removed { return .Err("cannot remove spool") }
     .Ok(nil)
   }
   fn release(self) -> Result<nil, str> {
@@ -29,14 +30,14 @@ pub struct Pack(spool: Spool, bytes: int, sha256: str) {
 }
 
 pub fn temporary(directory: str) -> Spool fails str {
-  if fs.mkdir(directory) is nil { fail "cannot create spool directory" }
+  if fs.mkdir(directory).is_err() { fail "cannot create spool directory" }
   let path = directory + "/{os.time()}_" + crypto.uuid() + ".tmp"
   let lock = fs.lock(path + ".lock", 0)?
   return Spool { path, lock }
 }
 
 pub fn inspect(spool: Spool, max_bytes: int) -> Pack fails str {
-  let bytes = fs.size(spool.path)
+  let bytes = present(fs.size(spool.path))
   if bytes is nil { fail "cannot inspect pack spool" }
   if bytes > max_bytes { fail "pack exceeds configured size limit" }
   let sha256 = hash.sha256_file(spool.path, max_bytes)?
@@ -83,7 +84,7 @@ fn owned_name(name: str) -> bool {
 /// Unique names are never reused. A live OS lock protects transfers of any age;
 /// the grace period also covers responses whose file ownership moved to HTTP.
 pub fn clean_orphans(directory: str, grace_seconds: float = 600.0) -> Result<int, str> {
-  let names = fs.list(directory)
+  let names = present(fs.list(directory))
   if names is nil { return .Err("cannot inspect spool directory") }
   let now = os.time()
   let mut removed = 0

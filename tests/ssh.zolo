@@ -57,8 +57,10 @@ fn successful(output: Output, label: str) -> process::Output {
 }
 
 fn read(path: str) -> str {
-  let value: str? = fs.read(path)
-  value ?? panic("SSH fixture file could not be read")
+  match fs.read(path) {
+    .Ok(value) => value,
+    .Err(_) => panic("SSH fixture file could not be read"),
+  }
 }
 
 fn read_proof(state: str) -> Proof {
@@ -69,12 +71,12 @@ fn read_proof(state: str) -> Proof {
 }
 
 fn write(path: str, content: str) {
-  if fs.write(path, content) is nil { panic("SSH fixture file could not be written") }
+  if fs.write(path, content).is_err() { panic("SSH fixture file could not be written") }
   checked(fs.chmod(path, 384), "restrict SSH fixture file permissions")
 }
 
 fn prepare(state: str, env_file: str) {
-  if fs.mkdir(state) is nil { panic("cannot create SSH fixture state") }
+  if fs.mkdir(state).is_err() { panic("cannot create SSH fixture state") }
   checked(fs.chmod(state, 448), "restrict SSH fixture directory permissions")
   for name in ["identity", "unregistered"] {
     let path = state + "/" + name
@@ -95,7 +97,7 @@ fn prepare(state: str, env_file: str) {
   checked(fs.chmod(proof_file, 384), "restrict SSH proof permissions")
   let proof = read_proof(state)
   let public_key = read(state + "/identity.pub").trim()
-  if fs.mkdir(path.dirname(env_file)) is nil {
+  if fs.mkdir(path.dirname(env_file)).is_err() {
     panic("cannot create SSH fixture environment directory")
   }
   write(
@@ -205,7 +207,7 @@ fn verify(state: str, repeat: bool) {
   let target = remote(proof.repo)
   if !repeat {
     if fs.exists(source) { panic("SSH state already contains a proof; use verify-repeat") }
-    if fs.mkdir(source) is nil { panic("cannot create SSH source") }
+    if fs.mkdir(source).is_err() { panic("cannot create SSH source") }
     let format = os.getenv("GITWAL_OBJECT_FORMAT") ?? "sha1"
     successful(
       git(state, ["init", "--initial-branch=main", "--object-format=" + format], source),

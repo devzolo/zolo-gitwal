@@ -4,6 +4,7 @@ use std::{os, process, http, hash, stream, fs}
 use object_store::{S3Client, S3Config, CredentialProvider}
 use auth::{new_token, valid_hash, Credential}
 use git::cache
+use domain::present
 use host::Host
 use cache_policy::Policy
 use ssh::{serve, pre_receive}
@@ -31,7 +32,7 @@ fn hook_launcher(executable: str) -> [str] {
   if executable.ends_with(".zolo") {
     panic("set GITWAL_SSH_LAUNCHER to the absolute Zolo command for VM SSH hooks")
   }
-  let absolute: str? = fs.abs(executable)
+  let absolute: str? = present(fs.abs(executable))
   return [absolute ?? panic("set GITWAL_SSH_LAUNCHER to an absolute command path")]
 }
 

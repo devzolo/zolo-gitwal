@@ -42,9 +42,9 @@ pub fn new_token() -> str {
 pub fn credential(header: str?) -> Credential {
   let text = header ?? ""
   if text == "" { return .Anonymous }
-  let separator = text.index_of(" ")
+  let separator = text.index_of(" ") ?? -1
   if separator < 0 { return .Malformed }
-  let scheme = text.slice(0, separator).lower()
+  let scheme = text.slice(0, separator).to_lower()
   let value = text.slice(separator + 1, text.len()).trim_start()
   var token = ""
   if scheme == "bearer" {
@@ -53,7 +53,7 @@ pub fn credential(header: str?) -> Credential {
     let decoded = base64.decode(value)
     if decoded is nil { return .Malformed }
     let pair: str = decoded
-    let colon = pair.index_of(":")
+    let colon = pair.index_of(":") ?? -1
     if colon < 0 { return .Malformed }
     token = pair.slice(colon + 1, pair.len())
   } else { return .Malformed }
@@ -112,17 +112,15 @@ pub fn claim(
   }
   match store.put(prefix(name) + "repo.json", meta.to_json().bytes(), .Create)? {
     .Written(etag) => .Ok(MetaSnapshot { meta, etag }),
-    .Conflict => match load_meta(store, name)? {
-      nil => .Err("repository metadata disappeared"),
-      existing => {
-        if !can_push(existing.meta, credential) {
-          return .Err("repository belongs to another token")
-        }
-        if existing.meta.object_format != format {
-          return .Err("repository object format mismatch")
-        }
-        .Ok(existing)
-      },
+    .Conflict => {
+      let existing = load_meta(store, name)? ?? return .Err("repository metadata disappeared")
+      if !can_push(existing.meta, credential) {
+        return .Err("repository belongs to another token")
+      }
+      if existing.meta.object_format != format {
+        return .Err("repository object format mismatch")
+      }
+      .Ok(existing)
     },
   }
 }
@@ -152,7 +150,7 @@ pub fn configure(
 
 @test
 fn token_validation_does_not_accept_malformed_credentials() {
-  let token = "zgw_" + "a".repeat_(64)
+  let token = "zgw_" + "a".repeat(64)
   match credential("Bearer " + token) {
     .Token(_) => { },
     _ => panic("valid token"),

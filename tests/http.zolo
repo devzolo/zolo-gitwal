@@ -204,7 +204,7 @@ fn clone(base: str, state: State, directory: str, name: str, authenticated: bool
     checked(hash.sha256_file(target + "/binary.dat", PAYLOAD_BYTES), "hash cloned binary") == state.binary_sha256,
     "clone changed binary contents",
   )
-  ensure(fs.read(target + "/README.txt") == state.text, "clone changed text")
+  ensure(checked(fs.read(target + "/README.txt"), "read cloned text") == state.text, "clone changed text")
   git(target, ["fsck", "--full"])
   let response = request(base, "/" + state.repository + ".git/monitor", credential)
   ensure(response.status == 200, "monitor unavailable")
@@ -250,7 +250,7 @@ fn transactions(base: str, state: State, source: str, first: str) {
     "push redelivery changed WAL",
   )
   let batch = packet(
-    "0".repeat_(state.commit.len()) + " " + state.commit + " refs/tags/atomic-check\0report-status atomic\n",
+    "0".repeat(state.commit.len()) + " " + state.commit + " refs/tags/atomic-check\0report-status atomic\n",
   ) + packet(first + " " + state.commit + " refs/heads/main\n") + "0000"
   let rejected = request(
     base,
@@ -329,7 +329,7 @@ fn main() {
   }
   let state_path = os.getenv("GITWAL_TEST_STATE") ?? "/state/smoke.json"
   let root = fs.temp_dir() + "/gitwal-http-" + crypto.uuid()
-  ensure(fs.mkdir(root) is not nil, "cannot create owned test directory")
+  ensure(fs.mkdir(root).is_ok(), "cannot create owned test directory")
   defer fs.rmdir(root, true)
   ready(base)
   cli()
@@ -352,7 +352,7 @@ fn main() {
   print("PASS anonymous health, web monitor and invalid route")
   if mode == "verify" {
     let state = checked(
-      State.from_json(fs.read(state_path) ?? panic("FAIL missing persistence state")),
+      State.from_json(checked(fs.read(state_path), "missing persistence state")),
       "decode persistence state",
     )
     private_acl(base, state, root)
@@ -361,7 +361,7 @@ fn main() {
     return
   }
   let source = root + "/source"
-  ensure(fs.mkdir(source) is not nil, "cannot create source")
+  ensure(fs.mkdir(source).is_ok(), "cannot create source")
   let format = os.getenv("GITWAL_TEST_OBJECT_FORMAT") ?? "sha1"
   ensure(format == "sha1" || format == "sha256", "test object format must be sha1 or sha256")
   git(source, ["init", "--initial-branch=main", "--object-format=" + format])
@@ -383,7 +383,7 @@ fn main() {
     ),
     object_format: format,
   }
-  ensure(fs.write(source + "/README.txt", state.text) is not nil, "write initial text")
+  ensure(fs.write(source + "/README.txt", state.text).is_ok(), "write initial text")
   git(source, ["add", "."])
   git(source, ["commit", "-m", "First smoke commit"])
   let remote = base + "/" + state.repository + ".git"
@@ -404,7 +404,7 @@ fn main() {
     "invalid packet accepted",
   )
   print("PASS first chunked push, private ACL, binary clone, Git integrity and invalid packet")
-  ensure(fs.write(source + "/README.txt", "Second Compose push\n") is not nil, "write second text")
+  ensure(fs.write(source + "/README.txt", "Second Compose push\n").is_ok(), "write second text")
   git(source, ["commit", "-am", "Second smoke commit"])
   git(source, ["push", remote, "HEAD:refs/heads/main"], token(), false)
   clone(base, state, root, "after-denied-push")
@@ -428,9 +428,9 @@ fn main() {
   }
   if state_directory == "" { state_directory = "." }
   if !fs.exists(state_directory) {
-    ensure(fs.mkdir(state_directory) is not nil, "cannot create state directory")
+    ensure(fs.mkdir(state_directory).is_ok(), "cannot create state directory")
   }
-  ensure(fs.write(state_path, state.to_json()) is not nil, "cannot save persistence state")
+  ensure(fs.write(state_path, state.to_json()).is_ok(), "cannot save persistence state")
   let permissions = checked(
     process.run("chmod", ["600", state_path]),
     "restrict persistence state permissions",

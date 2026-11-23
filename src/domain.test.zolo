@@ -8,9 +8,9 @@ test "repository names reject paths and option injection" for name in [
 }
 
 test "object IDs require the selected format" for (format, width) in [("sha1", 40), ("sha256", 64)] {
-  assert(valid_oid("a".repeat_(width), format))
-  assert(!valid_oid("a".repeat_(width - 1), format))
-  assert(!valid_oid("g".repeat_(width), format))
+  assert(valid_oid("a".repeat(width), format))
+  assert(!valid_oid("a".repeat(width - 1), format))
+  assert(!valid_oid("g".repeat(width), format))
 }
 
 test "references reject Git metacharacters" for name in [

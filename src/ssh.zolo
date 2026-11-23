@@ -4,7 +4,7 @@ use domain
 use domain::RefUpdate
 use std::{fs, os, process, stream, string}
 use auth::{Credential, load_meta, can_fetch, can_push}
-use domain::{repo_name, validate_updates}
+use domain::{repo_name, validate_updates, present}
 use git::cache
 use host::Host
 use pack::{Pack, temporary, spool}
@@ -17,7 +17,7 @@ pub struct Command(service: str, name: str)
 // This is a grammar, not a shell parser. Git's usual single quoted flat name
 // is accepted; escapes, paths, options and additional arguments are rejected.
 pub fn parse_command(original: str) -> Command fails str {
-  let separator = original.index_of(" ")
+  let separator = original.index_of(" ") ?? -1
   if separator < 0 { fail "expected a Git SSH command" }
   let service = original.slice(0, separator)
   if service != "git-upload-pack" && service != "git-receive-pack" {
@@ -41,7 +41,7 @@ schema Session {
 fn quote(value: str) -> str { "'" + value.replace("'", "'\"'\"'") + "'" }
 
 fn realpath(path: str) -> str fails str {
-  let absolute = fs.abs(path)
+  let absolute = present(fs.abs(path))
   if absolute is nil { fail "cannot resolve SSH session path" }
   return absolute
 }
@@ -105,12 +105,12 @@ pub fn serve(app: Host, presented: Credential, original: str, launcher: [str]) -
   let snapshot = load(app.store, command.name, format)?
   let directory = temporary(app.cache.root + "/.spool")?
   defer directory.close()
-  if fs.mkdir(directory.path) is nil { return .Err("cannot create SSH session") }
+  if fs.mkdir(directory.path).is_err() { return .Err("cannot create SSH session") }
   fs.chmod(directory.path, 448)?
   let isolated = cache(directory.path)?
   let repository = isolated.sync(app.store, command.name, snapshot)?
   let hooks = directory.path + "/hooks"
-  if fs.mkdir(hooks) is nil { return .Err("cannot create SSH hooks") }
+  if fs.mkdir(hooks).is_err() { return .Err("cannot create SSH hooks") }
   fs.chmod(hooks, 448)?
   if receiving {
     if launcher.len() == 0 { return .Err("missing trusted SSH hook launcher") }
@@ -126,14 +126,14 @@ pub fn serve(app: Host, presented: Credential, original: str, launcher: [str]) -
       token_digest: digest,
     }
     let session_path = directory.path + "/session.json"
-    if fs.write(session_path, session.to_json()) is nil { return .Err("cannot write SSH session") }
+    if fs.write(session_path, session.to_json()).is_err() { return .Err("cannot write SSH session") }
     fs.chmod(session_path, 384)?
     let arguments: [str] = []
     for argument in launcher { arguments.push(quote(argument)) }
     arguments.push("ssh-pre-receive")
     arguments.push(quote(session_path))
     let hook = hooks + "/pre-receive"
-    if fs.write(hook, "#!/bin/sh\nexec " + arguments.join(" ") + "\n") is nil {
+    if fs.write(hook, "#!/bin/sh\nexec " + arguments.join(" ") + "\n").is_err() {
       return .Err("cannot write SSH hook")
     }
     fs.chmod(hook, 448)?
@@ -180,7 +180,7 @@ fn incoming(app: Host, session: Session) -> Result<Pack, str> {
   }
   let pack_directory = absolute + "/pack"
   if !fs.exists(pack_directory) { return empty_pack(app) }
-  let entries = fs.list(pack_directory)
+  let entries = present(fs.list(pack_directory))
   if entries is nil { return .Err("missing Git quarantine pack directory") }
   let packs: [str] = []
   for entry in entries {
@@ -206,9 +206,9 @@ pub fn pre_receive(app: Host, session_path: str) -> Result<nil, str> {
   if !path.starts_with(owned + "/") && !path.starts_with(owned + "\\") {
     return .Err("SSH session is outside the owned spool")
   }
-  let size = fs.size(path)
+  let size = present(fs.size(path))
   if size is nil || size > 65536 { return .Err("invalid SSH session size") }
-  let text = fs.read(path)
+  let text = present(fs.read(path))
   if text is nil { return .Err("cannot read SSH session") }
   let session = Session.from_json(text)?
   repo_name(session.name)?
@@ -259,8 +259,8 @@ fn forced_command_has_no_shell_language() {
 
 @test
 fn pre_receive_transactions_are_strict() {
-  let old = "0".repeat_(40)
-  let next = "a".repeat_(40)
+  let old = "0".repeat(40)
+  let next = "a".repeat(40)
   let good = stream.from_bytes((old + " " + next + " refs/heads/main\n").bytes()).unwrap()
   defer good.close()
   assert(updates(good, "sha1").unwrap().len() == 1)
@@ -268,7 +268,7 @@ fn pre_receive_transactions_are_strict() {
     "", old + " " + next + " refs/heads/main", old + " " + next + " refs/heads/main \n",
     old + " " + next + " refs/heads/main\r\n", old + "  " + next + " refs/heads/main\n",
     old + " " + next + " ../escape\n",
-    (old + " " + next + " refs/heads/main\n").repeat_(2),
+    (old + " " + next + " refs/heads/main\n").repeat(2),
   ] {
     let reader = stream.from_bytes(malformed.bytes()).unwrap()
     defer reader.close()
@@ -278,7 +278,7 @@ fn pre_receive_transactions_are_strict() {
 
 @test
 fn pre_receive_transactions_are_bounded() {
-  let oversized = stream.from_bytes("x".repeat_(1048577).bytes()).unwrap()
+  let oversized = stream.from_bytes("x".repeat(1048577).bytes()).unwrap()
   defer oversized.close()
   assert(updates(oversized, "sha1").is_err())
 }
@@ -286,7 +286,7 @@ fn pre_receive_transactions_are_bounded() {
 @test
 fn pre_receive_transactions_support_sha256() {
   let sha256 = stream.from_bytes(
-    ("0".repeat_(64) + " " + "a".repeat_(64) + " refs/heads/main\n").bytes(),
+    ("0".repeat(64) + " " + "a".repeat(64) + " refs/heads/main\n").bytes(),
   ).unwrap()
   defer sha256.close()
   assert(updates(sha256, "sha256").unwrap().len() == 1)

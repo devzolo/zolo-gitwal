@@ -60,12 +60,12 @@ fn git_file(service: str, pack: Pack) -> http::Response {
 }
 
 pub struct Host (
-  store: Store,
-  cache: Cache,
-  compact_after: int,
-  max_push_bytes: int,
-  object_format: str = "sha1",
-  max_fetch_bytes: int = 10737418240,
+  pub store: Store,
+  pub cache: Cache,
+  pub compact_after: int,
+  pub max_push_bytes: int,
+  pub object_format: str = "sha1",
+  pub max_fetch_bytes: int = 10737418240,
 ) {
   fn validate(
     self,

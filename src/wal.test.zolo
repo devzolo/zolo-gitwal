@@ -28,7 +28,7 @@ mod tests {
   @test
   fn http_never_acknowledges_failed_wal_writes_and_can_retry() {
     let root = fs.temp_dir() + "/gitwal-ack-" + crypto.uuid()
-    assert(fs.mkdir(root) is not nil)
+    assert(fs.mkdir(root).is_ok())
     defer fs.rmdir(root, true)
     for suffix in [".pack", ".json", "index.json"] {
       let memory = MemoryStore::create().store()
@@ -58,7 +58,7 @@ mod tests {
         full_path: "/repo.git/git-receive-pack",
         version: "HTTP/1.1",
         headers: #{
-          authorization: "Bearer zgw_" + "a".repeat_(64),
+          authorization: "Bearer zgw_" + "a".repeat(64),
           "content-type": "application/x-git-receive-pack-request",
         },
         query: #{},
@@ -103,7 +103,7 @@ mod tests {
   @test
   fn compaction_retry_preserves_thin_tail_with_unreachable_historical_base() {
     let root = fs.temp_dir() + "/gitwal-thin-" + crypto.uuid()
-    assert(fs.mkdir(root) is not nil)
+    assert(fs.mkdir(root).is_ok())
     defer fs.rmdir(root, true)
     let memory = MemoryStore::create().store()
     let base_pack = hex.decode(BASE_PACK)

@@ -110,7 +110,10 @@ fn multipart_etag(etag: str) -> bool {
 fn inspect(store: Store, strict: bool) {
   let path = os.getenv("GITWAL_TEST_STATE") ?? "/state/smoke.json"
   let state = checked(
-    State.from_json(fs.read(path) ?? panic("cannot read smoke state")),
+    State.from_json(match fs.read(path) {
+      .Ok(text) => text,
+      .Err(_) => panic("cannot read smoke state"),
+    }),
     "decode smoke state",
   )
   let prefix = "repos/" + state.repository + "/"
@@ -162,7 +165,7 @@ fn inspect(store: Store, strict: bool) {
     ensure(!seen.contains(update.name), "compacted snapshot repeats a ref")
     seen.push(update.name)
     ensure(
-      update.old_oid == "0".repeat_(if index.object_format == "sha256" { 64 } else { 40 }),
+      update.old_oid == "0".repeat(if index.object_format == "sha256" { 64 } else { 40 }),
       "compacted snapshot does not replay from empty refs",
     )
     var matched = false
@@ -183,7 +186,7 @@ fn wait_file(path: str, deadline: float) {
 
 fn contender(store: Store, args: [str]) {
   ensure(args.len() == 7, "invalid CAS contender arguments")
-  ensure(fs.write(args[5], "ready") is not nil, "cannot signal CAS readiness")
+  ensure(fs.write(args[5], "ready").is_ok(), "cannot signal CAS readiness")
   wait_file(args[4], process.uptime() + 30.0)
   match checked(
     store.put(args[2], args[6].bytes(), .Match(args[3])),
@@ -250,7 +253,7 @@ fn contracts(connection: S3Client) {
     checked(store.put(race, "initial".bytes(), .Create), "create CAS race fixture"),
   )
   let directory = (os.getenv("TMPDIR") ?? os.getenv("TEMP") ?? "/tmp") + "/gitwal-cas-" + crypto.uuid()
-  ensure(fs.mkdir(directory) is not nil, "cannot create CAS barrier directory")
+  ensure(fs.mkdir(directory).is_ok(), "cannot create CAS barrier directory")
   defer fs.rmdir(directory, true)
   let gate = directory + "/release"
   let one = start(["contender", race, etag, gate, directory + "/one", "contender-one"])
@@ -260,7 +263,7 @@ fn contracts(connection: S3Client) {
   let deadline = process.uptime() + 30.0
   wait_file(directory + "/one", deadline)
   wait_file(directory + "/two", deadline)
-  ensure(fs.write(gate, "go") is not nil, "cannot release CAS contenders")
+  ensure(fs.write(gate, "go").is_ok(), "cannot release CAS contenders")
   let first_outcome = finish(one)
   let second_outcome = finish(two)
   ensure(first_outcome.status == 0 && second_outcome.status == 0, "CAS contender failed")

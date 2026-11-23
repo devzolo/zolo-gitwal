@@ -5,15 +5,15 @@ use domain
 use domain::RefUpdate
 use std::{process, fs, hash, stream}
 use object_store::Store
-use domain::{zero_oid, repo_name, tip, apply_updates}
+use domain::{zero_oid, repo_name, tip, apply_updates, present}
 use wal::{Index, Snapshot, read_entry, read_pack_file}
 use pack::{Pack, temporary, inspect}
 use cache_policy::{Policy, Lease, sweep_cache, acquired_lease}
 
 pub fn cache(root: str, policy: Policy = Policy {  }) -> Cache fails str {
-  if fs.mkdir(root + "/.locks") is nil { fail "cannot create cache root" }
-  if fs.mkdir(root + "/.spool") is nil { fail "cannot create spool directory" }
-  let absolute = fs.abs(root)
+  if fs.mkdir(root + "/.locks").is_err() { fail "cannot create cache root" }
+  if fs.mkdir(root + "/.spool").is_err() { fail "cannot create spool directory" }
+  let absolute = present(fs.abs(root))
   if absolute is nil { fail "cannot resolve cache root" }
   Cache { root: absolute, policy }
 }
@@ -149,7 +149,7 @@ pub struct Cache(root: str, policy: Policy = Policy {  }) {
   }
   fn invalidate(self, name: str) -> Result<nil, str> {
     let marker = self.path(name)? + "/gitwal.etag"
-    if fs.exists(marker) && fs.remove(marker) is nil {
+    if fs.exists(marker) && fs.remove(marker).is_err() {
       return .Err("cannot invalidate cache")
     }
     .Ok(nil)
@@ -159,11 +159,11 @@ pub struct Cache(root: str, policy: Policy = Policy {  }) {
   fn sync(self, store: Store, name: str, snapshot: Snapshot) -> Result<str, str> {
     let path = self.path(name)?
     let marker = path + "/gitwal.etag"
-    if snapshot.etag is not nil && fs.exists(path + "/HEAD") && fs.read(marker) == snapshot.etag {
+    if snapshot.etag is not nil && fs.exists(path + "/HEAD") && present(fs.read(marker)) == snapshot.etag {
       return .Ok(path)
     }
     // `path` is derived exclusively from this cache's absolute root and a validated flat name.
-    if fs.exists(path) && fs.rmdir(path, true) is nil {
+    if fs.exists(path) && fs.rmdir(path, true).is_err() {
       return .Err("cannot remove stale cache")
     }
     let format = snapshot.index.object_format
@@ -194,7 +194,7 @@ pub struct Cache(root: str, policy: Policy = Policy {  }) {
     command(path, ["fsck", "--connectivity-only", "--no-reflogs"])?
     let etag = snapshot.etag
     if etag is not nil {
-      if fs.write(marker, etag) is nil { return .Err("cannot checkpoint cache") }
+      if fs.write(marker, etag).is_err() { return .Err("cannot checkpoint cache") }
     }
     .Ok(path)
   }

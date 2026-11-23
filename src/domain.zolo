@@ -4,8 +4,17 @@ pub const ZERO_OID: str = "0000000000000000000000000000000000000000"
 
 pub fn valid_format(format: str) -> bool { format == "sha1" || format == "sha256" }
 
+/// The value of a `std::fs` result, or nil when the call failed: the callers
+/// report their own error, as they did when `std::fs` returned optionals.
+pub fn present<T>(result: Result<T, str>) -> T? {
+  match result {
+    .Ok(value) => value,
+    .Err(_) => nil,
+  }
+}
+
 pub fn zero_oid(format: str = "sha1") -> str {
-  if format == "sha256" { "0".repeat_(64) } else { ZERO_OID }
+  if format == "sha256" { "0".repeat(64) } else { ZERO_OID }
 }
 
 pub schema RefTip {
@@ -148,10 +157,10 @@ fn transactions_check_old_values_and_directory_conflicts() {
 
 @test
 fn object_formats_are_explicit_and_never_mix() {
-  let oid = "a".repeat_(64)
+  let oid = "a".repeat(64)
   assert(valid_oid(oid, "sha256"))
   assert(!valid_oid(oid))
-  assert(!valid_oid("a".repeat_(40), "sha256"))
+  assert(!valid_oid("a".repeat(40), "sha256"))
   let create = [RefUpdate { name: "refs/heads/main", old_oid: zero_oid("sha256"), new_oid: oid }]
   let refs = apply_updates([], create, "sha256").unwrap()
   assert(choose_head(refs, nil, "sha256") == "refs/heads/main")

@@ -1,35 +1,36 @@
 //! Cache eviction is local maintenance. OS locks protect every mutable repository.
 use std::{fs, os}
 use pack::clean_orphans
+use domain::present
 
 pub struct Policy (
-  max_bytes: int = 10737418240,
-  idle_seconds: float = 1800.0,
-  lock_timeout_ms: int = 30000,
-  sweep_seconds: float = 30.0,
+  pub max_bytes: int = 10737418240,
+  pub idle_seconds: float = 1800.0,
+  pub lock_timeout_ms: int = 30000,
+  pub sweep_seconds: float = 30.0,
 )
 
 pub struct Lease(lock: fs::FileLock, accessed: str) {
   fn close(self) -> Result<nil, str> {
     let written = fs.write(self.accessed, "{os.time()}")
     self.lock.close()?
-    if written is nil { return .Err("cannot record cache access") }
+    if written.is_err() { return .Err("cannot record cache access") }
     .Ok(nil)
   }
 }
 
 pub fn directory_bytes(path: str) -> Result<int, str> {
-  let entries = fs.list(path)
+  let entries = present(fs.list(path))
   if entries is nil { return .Err("cannot inspect cache directory") }
   var total = 0
   for entry in entries {
     let child = path + "/" + entry
-    let absolute = fs.abs(child)
+    let absolute = present(fs.abs(child))
     if absolute is nil || !absolute.starts_with(path + "/") && !absolute.starts_with(path + "\\") {
       return .Err("cache contains a link outside its owned directory")
     }
     if fs.is_dir(child) { total += directory_bytes(absolute)? } else {
-      let size = fs.size(child)
+      let size = present(fs.size(child))
       if size is nil { return .Err("cannot measure cache file") }
       total += size
     }
@@ -46,7 +47,7 @@ fn cache_name(value: str) -> bool {
 }
 
 fn accessed(path: str) -> float {
-  let text: str? = fs.read(path + "/gitwal.access")
+  let text: str? = present(fs.read(path + "/gitwal.access"))
   if text is nil { return 0.0 }
   text.parse::<float>() recover { _ => 0.0 }
 }
@@ -62,7 +63,7 @@ pub fn sweep_cache(root: str, policy: Policy, force: bool = false) -> Result<int
   }
   defer maintenance.close()
   let now = os.time()
-  let previous: str? = fs.read(root + "/.locks/last-sweep")
+  let previous: str? = present(fs.read(root + "/.locks/last-sweep"))
   if !force && previous is not nil {
     let last = match previous.parse::<float>() {
       .Ok(value) => value,
@@ -71,7 +72,7 @@ pub fn sweep_cache(root: str, policy: Policy, force: bool = false) -> Result<int
     if now - last < policy.sweep_seconds { return .Ok(0) }
   }
   clean_orphans(root + "/.spool")?
-  let names = fs.list(root)
+  let names = present(fs.list(root))
   if names is nil { return .Err("cannot list cache root") }
   let candidates: [Candidate] = []
   var total = 0
@@ -82,7 +83,7 @@ pub fn sweep_cache(root: str, policy: Policy, force: bool = false) -> Result<int
         .Err(_) => { continue },
       }
       let path = root + "/" + name
-      let absolute = fs.abs(path)
+      let absolute = present(fs.abs(path))
       if absolute is nil || !(absolute.starts_with(root + "/") || absolute.starts_with(root + "\\")) {
         lease.close()
         return .Err("cache path escaped its root")
@@ -113,11 +114,11 @@ pub fn sweep_cache(root: str, policy: Policy, force: bool = false) -> Result<int
     // Recheck access after locking: a request may have completed since the scan.
     let recent = accessed(candidate.path)
     if recent <= candidate.accessed_at && fs.exists(candidate.path) {
-      let absolute = fs.abs(candidate.path)
+      let absolute = present(fs.abs(candidate.path))
       if absolute is not nil && (absolute.starts_with(root + "/") || absolute.starts_with(
         root + "\\",
       )) {
-        if fs.rmdir(candidate.path, true) is nil {
+        if fs.rmdir(candidate.path, true).is_err() {
           lease.close()?
           return .Err("cannot evict cache")
         }
@@ -127,7 +128,7 @@ pub fn sweep_cache(root: str, policy: Policy, force: bool = false) -> Result<int
     }
     lease.close()?
   }
-  if fs.write(root + "/.locks/last-sweep", "{now}") is nil {
+  if fs.write(root + "/.locks/last-sweep", "{now}").is_err() {
     return .Err("cannot record cache maintenance")
   }
   .Ok(removed)

@@ -4,8 +4,8 @@ use wal::{Snapshot, load, publish, compact, read_entry, read_pack, prefix}
 
 fn accepted(_snapshot: Snapshot) -> Result<nil, str> { .Ok(nil) }
 
-fn oid_a() -> str { "1".repeat_(40) }
-fn oid_b() -> str { "2".repeat_(40) }
+fn oid_a() -> str { "1".repeat(40) }
+fn oid_b() -> str { "2".repeat(40) }
 
 @test
 fn publication_is_durable_and_exact_redelivery_writes_nothing() {

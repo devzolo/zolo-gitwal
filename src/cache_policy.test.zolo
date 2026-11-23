@@ -2,21 +2,22 @@
 mod tests {
   use std::{fs, crypto, stream}
   use git::cache
+  use domain::present
   use pack::{temporary, clean_orphans, spool}
 
   fn fixture() -> str {
     let root = fs.temp_dir() + "/gitwal-cache-test-" + crypto.uuid()
-    assert(fs.mkdir(root) is not nil)
-    let absolute: str? = fs.abs(root)
+    assert(fs.mkdir(root).is_ok())
+    let absolute: str? = present(fs.abs(root))
     absolute ?? panic("cannot resolve test directory")
   }
 
   fn entry(root: str, name: str, accessed: str) {
     let cached = cache(root).unwrap()
     let path = cached.path(name).unwrap()
-    assert(fs.mkdir(path) is not nil)
-    assert(fs.write(path + "/objects", "x".repeat_(100)) is not nil)
-    assert(fs.write(path + "/gitwal.access", accessed) is not nil)
+    assert(fs.mkdir(path).is_ok())
+    assert(fs.write(path + "/objects", "x".repeat(100)).is_ok())
+    assert(fs.write(path + "/gitwal.access", accessed).is_ok())
   }
 
   @test
