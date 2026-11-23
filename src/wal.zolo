@@ -336,8 +336,8 @@ fn compact_with(
     if current.index.object_format != base.index.object_format {
       return .Err("repository object format mismatch")
     }
-    // Array.slice uses an inclusive upper bound.
-    if !equal(current.index.entries.slice(0, base.index.entries.len() - 1), base.index.entries) {
+    // Array.slice is half-open: [0, len) is the whole base chain.
+    if !equal(current.index.entries.slice(0, base.index.entries.len()), base.index.entries) {
       return .Ok(current)
     }
     let next = Index {

@@ -2,6 +2,7 @@
 mod tests {
   use std::{fs, crypto, stream}
   use git::cache
+  use cache_policy::Policy
   use domain::present
   use pack::{temporary, clean_orphans, spool}
 

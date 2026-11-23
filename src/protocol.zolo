@@ -46,8 +46,8 @@ pub fn parse_push(body: [int], format: str = "sha1") -> BufferedPush fails str {
     if size < 4 || size > 65520 || offset + size > body.len() {
       fail "truncated or invalid packet"
     }
-    // Array.slice uses an inclusive upper bound; pkt-line sizes count bytes.
-    let raw = body.slice(offset + 4, offset + size - 1)
+    // Array.slice is half-open; pkt-line sizes count bytes.
+    let raw = body.slice(offset + 4, offset + size)
     // Commands are UTF-8; a replacement character must never create a different ref.
     let line = string.from_bytes(raw)
     if !equal(line.bytes(), raw) { fail "command is not UTF-8" }

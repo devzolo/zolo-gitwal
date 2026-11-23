@@ -140,7 +140,7 @@ fn inspect(store: Store, strict: bool) {
     let pack = found(store, base + ".pack")
     ensure(pack.data.len() == entry.pack_bytes, "WAL pack byte count mismatch")
     ensure(
-      entry.pack_bytes == 0 || pack.data.len() >= 4 && string.from_bytes(pack.data.slice(0, 3)) == "PACK",
+      entry.pack_bytes == 0 || pack.data.len() >= 4 && string.from_bytes(pack.data.slice(0, 4)) == "PACK",
       "durable WAL object is not a Git pack",
     )
     ensure(hash.sha256(pack.data) == entry.pack_sha256, "WAL pack SHA-256 mismatch")
